@@ -520,6 +520,8 @@ typedef struct {
     uint64_t repin_interval;
     /* 0 => 使用模型 top-k；低内存模式传 1。 */
     int minimum_slots;
+    /* 非零时，所有层共用这些槽位；只允许同步专家加载路径使用。 */
+    int global_slots;
 } ColiDeepSeekV4ExpertStoreOptions;
 
 int coli_deepseek_v4_expert_store_open(
@@ -596,6 +598,10 @@ typedef struct {
     /* 0 分别表示 routed_topk / experts_per_layer。 */
     int minimum_expert_slots;
     int maximum_expert_slots;
+    /* 非零时，专家槽位不再按稀疏层数复制。 */
+    int global_expert_slots;
+    /* 0 使用默认系统余量；磁盘优先模式使用较小但非零的保底值。 */
+    uint64_t system_reserve_override_bytes;
     /* 允许显式预算高于当前可用物理内存，由操作系统负责压缩和换页。 */
     int allow_swap;
 } ColiDeepSeekV4ResourceInputs;
@@ -715,6 +721,7 @@ struct ColiV4Session {
     int *generated;
     int max_prompt_tokens;
     int max_new_tokens_cap;
+    int state_capacity;
     int prompt_count;
     int generated_count;
     Tok tokenizer;

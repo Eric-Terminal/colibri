@@ -679,18 +679,16 @@ uint64_t coli_v4_os_available_memory(void) {
     status.dwLength = sizeof(status);
     return GlobalMemoryStatusEx(&status) ? (uint64_t)status.ullAvailPhys : 0;
 #elif defined(__APPLE__)
-    /* No /proc and no _SC_AVPHYS_PAGES on macOS. "Available" is what the
-     * kernel could hand out without swapping: free + inactive pages -- the
-     * same approximation Activity Monitor reports, and the closest analogue
-     * of Linux's MemAvailable (which also counts reclaimable cache). */
+    /* macOS 没有 /proc 或 _SC_AVPHYS_PAGES。可用量采用无需换页即可回收的
+     * free、inactive 与 speculative 页，语义最接近 Linux MemAvailable。 */
     mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
     vm_statistics64_data_t vm;
     vm_size_t page = 0;
     if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
                           (host_info64_t)&vm, &count) == KERN_SUCCESS &&
         host_page_size(mach_host_self(), &page) == KERN_SUCCESS && page)
-        return ((uint64_t)vm.free_count + (uint64_t)vm.inactive_count) *
-               (uint64_t)page;
+        return ((uint64_t)vm.free_count + (uint64_t)vm.inactive_count +
+                (uint64_t)vm.speculative_count) * (uint64_t)page;
     return 0;
 #else
     FILE *stream = fopen("/proc/meminfo", "r");
@@ -739,6 +737,8 @@ int coli_v4_resource_plan_compute(
     uint64_t system = explicit_process_limit ? 0 : available / 8;
     if (!explicit_process_limit && system < 512 * MIB) system = 512 * MIB;
     if (system > 4096 * MIB) system = 4096 * MIB;
+    if (!explicit_process_limit && inputs->system_reserve_override_bytes)
+        system = inputs->system_reserve_override_bytes;
     plan->system_reserve_bytes = system;
 
     uint64_t layers_twice;
@@ -747,9 +747,10 @@ int coli_v4_resource_plan_compute(
                 &plan->runtime_reserve_bytes))
         return plan_error(error, error_size, "V4 runtime reserve overflow");
 
-    uint64_t per_slot;
-    if (multiply_u64((uint64_t)inputs->sparse_layers,
-                     inputs->expert_record_bytes, &per_slot) ||
+    uint64_t per_slot = inputs->expert_record_bytes;
+    if ((!inputs->global_expert_slots &&
+         multiply_u64((uint64_t)inputs->sparse_layers,
+                      inputs->expert_record_bytes, &per_slot)) ||
         multiply_u64(per_slot, (uint64_t)minimum_slots,
                      &plan->minimum_expert_bytes))
         return plan_error(error, error_size, "V4 expert-cache size overflow");
@@ -1007,7 +1008,9 @@ static int build_runtime_plan(ColiV4Engine *engine,
         .experts_per_layer = config.n_routed_experts,
         .minimum_expert_slots = runtime->low_memory ? 1 : 0,
         .maximum_expert_slots = runtime->low_memory ? 1 : 0,
-        .allow_swap = runtime->low_memory,
+        .global_expert_slots = runtime->low_memory,
+        .system_reserve_override_bytes = runtime->low_memory ? 128 * MIB : 0,
+        .allow_swap = 0,
     };
     return coli_v4_resource_plan_compute(plan, &inputs, error, error_size);
 }
@@ -1042,8 +1045,8 @@ int coli_v4_expert_store_open_planned(
     if (build_runtime_plan(engine, options, &plan, error, error_size)) return -1;
     if (runtime->low_memory)
         fprintf(stderr,
-                "v4_low_memory mode=single-slot-sync os_available=%.2fGiB "
-                "budget=%.2fGiB swap=allowed\n",
+                "v4_low_memory mode=global-single-slot-sync "
+                "os_available=%.2fGiB budget=%.2fGiB swap=avoided\n",
                 plan.os_available_bytes / (double)GIB,
                 plan.planner_available_bytes / (double)GIB);
     uint64_t per_slot = plan.expert_cache_bytes /
@@ -1070,7 +1073,7 @@ int coli_v4_expert_store_open_planned(
     }
     uint64_t safe_payload = plan.planner_available_bytes - fixed -
                             dense_bytes;
-    int requested_head = -1;
+    int requested_head = runtime->low_memory ? 0 : -1;
     int resident_head = safe_payload >= plan.minimum_expert_bytes +
                                       head_bytes + 256 * MIB;
     if (requested_head == 0) resident_head = 0;
@@ -5432,6 +5435,7 @@ typedef struct {
 } V4ExpertRecord;
 
 typedef struct {
+    int layer;
     int expert;
     unsigned references;
     uint64_t used;
@@ -5444,6 +5448,7 @@ typedef struct {
     int layers;
     int experts_per_layer;
     int slots_per_layer;
+    int global_slots;
     uint64_t record_bytes;
     V4ExpertRecord *records;
     V4ExpertSlot *slots;
@@ -5541,7 +5546,13 @@ static V4ExpertRecord *get_record(V4ExpertStoreState *state, ColiExpertKey key) 
 }
 
 static V4ExpertSlot *layer_slots(V4ExpertStoreState *state, int layer) {
-    return state->slots + (size_t)layer * state->slots_per_layer;
+    return state->slots + (state->global_slots
+        ? 0 : (size_t)layer * state->slots_per_layer);
+}
+
+static size_t expert_slot_count(const V4ExpertStoreState *state) {
+    return (size_t)state->slots_per_layer *
+        (state->global_slots ? 1u : (size_t)state->layers);
 }
 
 static void fill_tensor_view(ColiTensorView *view,
@@ -5580,7 +5591,8 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
     V4ExpertSlot *slots = layer_slots(state, key.layer);
     V4ExpertSlot *slot = NULL;
     for (int i = 0; i < state->slots_per_layer; i++) {
-        if (slots[i].slab && slots[i].expert == key.expert) {
+        if (slots[i].slab && slots[i].layer == key.layer &&
+            slots[i].expert == key.expert) {
             slot = &slots[i];
             state->stats.hits++;
             break;
@@ -5607,6 +5619,7 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
             state->stats.resident_bytes += state->record_bytes;
         }
         /* A short read must never expose a partially overwritten old slot. */
+        slot->layer = -1;
         slot->expert = -1;
         struct timespec disk_t0;
         clock_gettime(CLOCK_MONOTONIC, &disk_t0);
@@ -5633,6 +5646,7 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
                 (double)(disk_t1.tv_sec - disk_t0.tv_sec) +
                 (disk_t1.tv_nsec - disk_t0.tv_nsec) * 1e-9;
         }
+        slot->layer = key.layer;
         slot->expert = key.expert;
         state->stats.misses++;
         state->stats.bytes_read += record->record_bytes;
@@ -5692,7 +5706,8 @@ static int prefetch(ColiExpertStore *store, const ColiExpertKey *keys,
         int resident = 0;
         V4ExpertSlot *slots = layer_slots(state, keys[i].layer);
         for (int slot = 0; slot < state->slots_per_layer; slot++)
-            if (slots[slot].slab && slots[slot].expert == keys[i].expert) {
+            if (slots[slot].slab && slots[slot].layer == keys[i].layer &&
+                slots[slot].expert == keys[i].expert) {
                 resident = 1; break;
             }
         if (resident) continue;
@@ -5739,7 +5754,7 @@ static void destroy(ColiExpertStore *store) {
     V4ExpertStoreState *state = store->state;
     if (state) {
         assert(state->active_leases == 0 && "destroy with active expert leases");
-        for (int i = 0; i < state->layers * state->slots_per_layer; i++)
+        for (size_t i = 0; i < expert_slot_count(state); i++)
             /* aligned_slab means posix_memalign, which on Windows is
              * _aligned_malloc and must not reach free(). */
             if (state->slots[i].aligned_slab)
@@ -5766,7 +5781,8 @@ int coli_deepseek_v4_expert_store_open(
     if (!options || !output || !options->model_dir || options->layers < 1 ||
         options->experts_per_layer < 1 || !options->cache_bytes ||
         options->minimum_slots < 0 ||
-        options->minimum_slots > options->experts_per_layer)
+        options->minimum_slots > options->experts_per_layer ||
+        options->global_slots < 0 || options->global_slots > 1)
         return set_error(error, error_size, "invalid DeepSeek-V4 ExpertStore options");
     *output = NULL;
     ColiExpertStore *store = calloc(1, sizeof(*store));
@@ -5779,6 +5795,7 @@ int coli_deepseek_v4_expert_store_open(
     pthread_mutex_init(&state->mutex, NULL);
     state->layers = options->layers;
     state->experts_per_layer = options->experts_per_layer;
+    state->global_slots = options->global_slots;
     if (coli_st_index_open(&state->index, options->model_dir, error, error_size) != 0)
         goto fail;
     size_t record_count = (size_t)state->layers * state->experts_per_layer;
@@ -5801,8 +5818,9 @@ int coli_deepseek_v4_expert_store_open(
             }
         }
     }
-    state->slots_per_layer = (int)(options->cache_bytes /
-        ((uint64_t)state->layers * state->record_bytes));
+    uint64_t slot_span = state->record_bytes *
+        (state->global_slots ? 1u : (uint64_t)state->layers);
+    state->slots_per_layer = (int)(options->cache_bytes / slot_span);
     int minimum_slots = options->minimum_slots > 0
         ? options->minimum_slots
         : (state->experts_per_layer < 6 ? state->experts_per_layer : 6);
@@ -5810,20 +5828,20 @@ int coli_deepseek_v4_expert_store_open(
         set_error(error, error_size,
                   "cache budget cannot hold %d active experts per layer "
                   "(need %llu bytes)", minimum_slots,
-                  (unsigned long long)((uint64_t)state->layers * minimum_slots *
-                                       state->record_bytes));
+                  (unsigned long long)(slot_span * (uint64_t)minimum_slots));
         goto fail;
     }
     if (state->slots_per_layer > state->experts_per_layer)
         state->slots_per_layer = state->experts_per_layer;
-    state->slots = calloc((size_t)state->layers * state->slots_per_layer,
-                          sizeof(*state->slots));
+    state->slots = calloc(expert_slot_count(state), sizeof(*state->slots));
     if (!state->slots) {
         set_error(error, error_size, "out of memory creating expert cache slots");
         goto fail;
     }
-    for (int i = 0; i < state->layers * state->slots_per_layer; i++)
+    for (size_t i = 0; i < expert_slot_count(state); i++) {
+        state->slots[i].layer = -1;
         state->slots[i].expert = -1;
+    }
     size_t telemetry_cells =
         (size_t)state->layers * state->experts_per_layer;
     state->ehit = calloc(telemetry_cells, sizeof(*state->ehit));
@@ -5832,8 +5850,8 @@ int coli_deepseek_v4_expert_store_open(
         set_error(error, error_size, "out of memory creating expert telemetry");
         goto fail;
     }
-    state->stats.capacity_bytes = (uint64_t)state->layers *
-                                  state->slots_per_layer * state->record_bytes;
+    state->stats.capacity_bytes = (uint64_t)expert_slot_count(state) *
+                                   state->record_bytes;
     store->ops = &operations;
     store->state = state;
     *output = store;
@@ -6250,7 +6268,8 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
     V4ExpertSlot *slots = layer_slots(state, key.layer);
     V4ExpertSlot *slot = NULL;
     for (int i = 0; i < state->slots_per_layer; i++) {
-        if (slots[i].slab && slots[i].expert == key.expert) {
+        if (slots[i].slab && slots[i].layer == key.layer &&
+            slots[i].expert == key.expert) {
             slot = &slots[i]; slot->references++;
             state->active_leases++;
             slot->used = ++state->clock; state->stats.hits++;
@@ -6292,7 +6311,7 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
         state->stats.resident_bytes += state->record_bytes;
     }
     policy->packed[hot_slot_index(state, slot)] = 0;
-    slot->expert = -1; slot->references = 1;
+    slot->layer = -1; slot->expert = -1; slot->references = 1;
     state->active_leases++;
     slot->used = ++state->clock;
     pthread_mutex_unlock(&state->mutex);
@@ -6306,13 +6325,14 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
         (double)(disk_t1.tv_sec - disk_t0.tv_sec) +
         (disk_t1.tv_nsec - disk_t0.tv_nsec) * 1e-9;
     if (read_result) {
-        slot->references = 0; slot->expert = -1;
+        slot->references = 0; slot->layer = -1; slot->expert = -1;
         if (state->active_leases) state->active_leases--;
         pthread_mutex_unlock(&state->mutex);
         memset(view, 0, sizeof(*view));
         return -1;
     }
-    slot->expert = key.expert; slot->used = ++state->clock;
+    slot->layer = key.layer; slot->expert = key.expert;
+    slot->used = ++state->clock;
     state->stats.misses++; state->stats.bytes_read += record->record_bytes;
     if (hot_is_pinned(policy, key.layer, key.expert))
         hot_pack_slot_locked(policy, state, record, slot);
@@ -6439,7 +6459,7 @@ int COLI_V4_ROWS16_STORE_OPEN(
     V4HotPolicy *policy = calloc(1, sizeof(*policy));
     size_t records = (size_t)state->layers * state->experts_per_layer;
     size_t pins = (size_t)state->layers * (pin_count ? pin_count : 1);
-    size_t slots = (size_t)state->layers * state->slots_per_layer;
+    size_t slots = expert_slot_count(state);
     if (policy) policy->usage = calloc(records, sizeof(*policy->usage));
     if (policy) policy->layer_requests = calloc(
         (size_t)state->layers, sizeof(*policy->layer_requests));
@@ -7168,6 +7188,7 @@ int coli_v4_engine_open(ColiV4Engine **output,
                 .pin_slots_per_layer = engine->runtime.pin_slots_per_layer,
                 .repin_interval = engine->runtime.repin_interval,
                 .minimum_slots = engine->runtime.low_memory ? 1 : 0,
+                .global_slots = engine->runtime.low_memory,
             },
             &engine->experts, error, error_size))
         goto fail;
@@ -8216,6 +8237,16 @@ int coli_v4_session_create(ColiV4Session **output, ColiV4Engine *engine,
     session->max_new_tokens_cap =
         options && options->max_new_tokens_cap > 0 ? options->max_new_tokens_cap
                                                    : 512;
+    session->state_capacity = session->max_prompt_tokens;
+    if (coli_v4_low_memory_enabled()) {
+        const char *chunk_text = getenv("COLI_V4_PREFILL_CHUNK");
+        int chunk = chunk_text ? atoi(chunk_text) : 32;
+        /* 投机批次最多 25 行；保留这个下限避免共享工作区越界。 */
+        if (chunk < 25) chunk = 25;
+        if (chunk > 64) chunk = 64;
+        if (chunk < session->state_capacity)
+            session->state_capacity = chunk;
+    }
 
     const char *model_dir = coli_v4_engine_target_model_dir(engine);
     char tokenizer_path[4096];
@@ -8250,7 +8281,7 @@ int coli_v4_session_create(ColiV4Session **output, ColiV4Engine *engine,
     }
 
     size_t hd = (size_t)session->config.hc_mult * session->config.hidden_size;
-    size_t slots = (size_t)session->max_prompt_tokens;
+    size_t slots = (size_t)session->state_capacity;
     session->state = malloc(slots * hd * sizeof(float));
     session->next = malloc(slots * hd * sizeof(float));
     session->hidden = malloc((size_t)session->config.hidden_size * sizeof(float));
@@ -8265,6 +8296,13 @@ int coli_v4_session_create(ColiV4Session **output, ColiV4Engine *engine,
             snprintf(error, error_size, "out of memory allocating session buffers");
         return -1;
     }
+    if (coli_v4_low_memory_enabled())
+        fprintf(stderr,
+                "v4_low_memory prefill_chunk=%d context=%d "
+                "workspace=%.2fMiB\n",
+                session->state_capacity, session->max_prompt_tokens,
+                2.0 * session->state_capacity * hd * sizeof(float) /
+                    1048576.0);
     /* Holds prompt and generated ids together: the next request's prompt
      * contains both, so both have to match for the state to be reusable.
      * A failure here is not an error — kv_prefix_alloc leaves the record empty,
@@ -8430,28 +8468,34 @@ int coli_v4_session_generate(ColiV4Session *session,
                 reuse, prompt_count);
 
     int fresh = prompt_count - reuse;
-    for (int item = 0; item < fresh; item++)
-        if (load_embedding(state + (size_t)item * hd, index, config,
-                           session->prompt_ids[reuse + item])) {
-            /* The state now matches neither the old ids nor the new ones. */
+    double setup_done = spec_now();
+    int final_chunk = 0;
+    for (int offset = 0; offset < fresh; offset += final_chunk) {
+        final_chunk = fresh - offset;
+        if (final_chunk > session->state_capacity)
+            final_chunk = session->state_capacity;
+        for (int item = 0; item < final_chunk; item++)
+            if (load_embedding(state + (size_t)item * hd, index, config,
+                               session->prompt_ids[reuse + offset + item])) {
+                /* 工作区此时既不对应旧前缀，也不完整对应新前缀。 */
+                kv_prefix_taint(&session->fed);
+                if (error && error_size)
+                    snprintf(error, error_size, "cannot load embedding");
+                return -1;
+            }
+        if (target_batch(
+                engine, &state, &next, attention, index, config, experts,
+                session->prompt_ids + reuse + offset, reuse + offset,
+                final_chunk, error, error_size)) {
             kv_prefix_taint(&session->fed);
-            if (error && error_size)
-                snprintf(error, error_size, "cannot load embedding");
             return -1;
         }
-
-    double setup_done = spec_now();
-    if (target_batch(engine, &state, &next, attention, index, config, experts,
-                     session->prompt_ids + reuse, reuse, fresh,
-                     error, error_size)) {
-        kv_prefix_taint(&session->fed);
-        return -1;
     }
     session->state = state;
     session->next = next;
-    /* The batch holds only the fresh tail, so the final row is at fresh-1
-     * even though its absolute position is prompt_count-1. */
-    const float *last = state + (size_t)(fresh - 1) * hd;
+    /* 工作区只保留最后一个分块，因此最终行位于 final_chunk-1，
+     * 但它的绝对位置仍然是 prompt_count-1。 */
+    const float *last = state + (size_t)(final_chunk - 1) * hd;
     int current = 0;
     float current_logit = 0.0f;
     if (final_hidden(hidden, last, index, config, error, error_size) ||
@@ -9909,6 +9953,7 @@ typedef struct {
 } V4ExpertRecord;
 
 typedef struct {
+    int layer;
     int expert;
     unsigned references;
     uint64_t used;
@@ -9920,6 +9965,7 @@ typedef struct {
     int layers;
     int experts_per_layer;
     int slots_per_layer;
+    int global_slots;
     uint64_t record_bytes;
     V4ExpertRecord *records;
     V4ExpertSlot *slots;
@@ -10017,7 +10063,13 @@ static V4ExpertRecord *get_record(V4ExpertStoreState *state, ColiExpertKey key) 
 }
 
 static V4ExpertSlot *layer_slots(V4ExpertStoreState *state, int layer) {
-    return state->slots + (size_t)layer * state->slots_per_layer;
+    return state->slots + (state->global_slots
+        ? 0 : (size_t)layer * state->slots_per_layer);
+}
+
+static size_t expert_slot_count(const V4ExpertStoreState *state) {
+    return (size_t)state->slots_per_layer *
+        (state->global_slots ? 1u : (size_t)state->layers);
 }
 
 static void fill_tensor_view(ColiTensorView *view,
@@ -10056,7 +10108,8 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
     V4ExpertSlot *slots = layer_slots(state, key.layer);
     V4ExpertSlot *slot = NULL;
     for (int i = 0; i < state->slots_per_layer; i++) {
-        if (slots[i].slab && slots[i].expert == key.expert) {
+        if (slots[i].slab && slots[i].layer == key.layer &&
+            slots[i].expert == key.expert) {
             slot = &slots[i];
             state->stats.hits++;
             break;
@@ -10083,6 +10136,7 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
             state->stats.resident_bytes += state->record_bytes;
         }
         /* A short read must never expose a partially overwritten old slot. */
+        slot->layer = -1;
         slot->expert = -1;
         struct timespec disk_t0;
         clock_gettime(CLOCK_MONOTONIC, &disk_t0);
@@ -10109,6 +10163,7 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
                 (double)(disk_t1.tv_sec - disk_t0.tv_sec) +
                 (disk_t1.tv_nsec - disk_t0.tv_nsec) * 1e-9;
         }
+        slot->layer = key.layer;
         slot->expert = key.expert;
         state->stats.misses++;
         state->stats.bytes_read += record->record_bytes;
@@ -10168,7 +10223,8 @@ static int prefetch(ColiExpertStore *store, const ColiExpertKey *keys,
         int resident = 0;
         V4ExpertSlot *slots = layer_slots(state, keys[i].layer);
         for (int slot = 0; slot < state->slots_per_layer; slot++)
-            if (slots[slot].slab && slots[slot].expert == keys[i].expert) {
+            if (slots[slot].slab && slots[slot].layer == keys[i].layer &&
+                slots[slot].expert == keys[i].expert) {
                 resident = 1; break;
             }
         if (resident) continue;
@@ -10215,7 +10271,7 @@ static void destroy(ColiExpertStore *store) {
     V4ExpertStoreState *state = store->state;
     if (state) {
         assert(state->active_leases == 0 && "destroy with active expert leases");
-        for (int i = 0; i < state->layers * state->slots_per_layer; i++)
+        for (size_t i = 0; i < expert_slot_count(state); i++)
             free(state->slots[i].slab);   /* this store allocates slabs with
                                            * malloc only; the aligned path and
                                            * its compat_aligned_free live in the
@@ -10240,7 +10296,8 @@ int coli_deepseek_v4_expert_store_open(
     if (!options || !output || !options->model_dir || options->layers < 1 ||
         options->experts_per_layer < 1 || !options->cache_bytes ||
         options->minimum_slots < 0 ||
-        options->minimum_slots > options->experts_per_layer)
+        options->minimum_slots > options->experts_per_layer ||
+        options->global_slots < 0 || options->global_slots > 1)
         return set_error(error, error_size, "invalid DeepSeek-V4 ExpertStore options");
     *output = NULL;
     ColiExpertStore *store = calloc(1, sizeof(*store));
@@ -10253,6 +10310,7 @@ int coli_deepseek_v4_expert_store_open(
     pthread_mutex_init(&state->mutex, NULL);
     state->layers = options->layers;
     state->experts_per_layer = options->experts_per_layer;
+    state->global_slots = options->global_slots;
     if (coli_st_index_open(&state->index, options->model_dir, error, error_size) != 0)
         goto fail;
     size_t record_count = (size_t)state->layers * state->experts_per_layer;
@@ -10275,8 +10333,9 @@ int coli_deepseek_v4_expert_store_open(
             }
         }
     }
-    state->slots_per_layer = (int)(options->cache_bytes /
-        ((uint64_t)state->layers * state->record_bytes));
+    uint64_t slot_span = state->record_bytes *
+        (state->global_slots ? 1u : (uint64_t)state->layers);
+    state->slots_per_layer = (int)(options->cache_bytes / slot_span);
     int minimum_slots = options->minimum_slots > 0
         ? options->minimum_slots
         : (state->experts_per_layer < 6 ? state->experts_per_layer : 6);
@@ -10284,20 +10343,20 @@ int coli_deepseek_v4_expert_store_open(
         set_error(error, error_size,
                   "cache budget cannot hold %d active experts per layer "
                   "(need %llu bytes)", minimum_slots,
-                  (unsigned long long)((uint64_t)state->layers * minimum_slots *
-                                       state->record_bytes));
+                  (unsigned long long)(slot_span * (uint64_t)minimum_slots));
         goto fail;
     }
     if (state->slots_per_layer > state->experts_per_layer)
         state->slots_per_layer = state->experts_per_layer;
-    state->slots = calloc((size_t)state->layers * state->slots_per_layer,
-                          sizeof(*state->slots));
+    state->slots = calloc(expert_slot_count(state), sizeof(*state->slots));
     if (!state->slots) {
         set_error(error, error_size, "out of memory creating expert cache slots");
         goto fail;
     }
-    for (int i = 0; i < state->layers * state->slots_per_layer; i++)
+    for (size_t i = 0; i < expert_slot_count(state); i++) {
+        state->slots[i].layer = -1;
         state->slots[i].expert = -1;
+    }
     size_t telemetry_cells =
         (size_t)state->layers * state->experts_per_layer;
     state->ehit = calloc(telemetry_cells, sizeof(*state->ehit));
@@ -10306,8 +10365,8 @@ int coli_deepseek_v4_expert_store_open(
         set_error(error, error_size, "out of memory creating expert telemetry");
         goto fail;
     }
-    state->stats.capacity_bytes = (uint64_t)state->layers *
-                                  state->slots_per_layer * state->record_bytes;
+    state->stats.capacity_bytes = (uint64_t)expert_slot_count(state) *
+                                   state->record_bytes;
     store->ops = &operations;
     store->state = state;
     *output = store;

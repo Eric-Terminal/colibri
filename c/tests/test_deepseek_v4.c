@@ -248,10 +248,16 @@ static int write_fixture(const char *path) {
         "\"resident\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[3,7]},"
         "\"layers.0.ffn.experts.0.w1.weight\":{\"dtype\":\"I8\",\"shape\":[1,16],\"data_offsets\":[7,23]},"
         "\"layers.0.ffn.experts.0.w2.weight\":{\"dtype\":\"I8\",\"shape\":[1,16],\"data_offsets\":[23,39]},"
-        "\"layers.0.ffn.experts.0.w3.weight\":{\"dtype\":\"I8\",\"shape\":[1,16],\"data_offsets\":[39,55]}"
+        "\"layers.0.ffn.experts.0.w3.weight\":{\"dtype\":\"I8\",\"shape\":[1,16],\"data_offsets\":[39,55]},"
+        "\"layers.1.ffn.experts.0.w1.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[1,1],\"data_offsets\":[55,56]},"
+        "\"layers.1.ffn.experts.0.w2.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[1,1],\"data_offsets\":[56,57]},"
+        "\"layers.1.ffn.experts.0.w3.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[1,1],\"data_offsets\":[57,58]},"
+        "\"layers.1.ffn.experts.0.w1.weight\":{\"dtype\":\"I8\",\"shape\":[1,16],\"data_offsets\":[58,74]},"
+        "\"layers.1.ffn.experts.0.w2.weight\":{\"dtype\":\"I8\",\"shape\":[1,16],\"data_offsets\":[74,90]},"
+        "\"layers.1.ffn.experts.0.w3.weight\":{\"dtype\":\"I8\",\"shape\":[1,16],\"data_offsets\":[90,106]}"
         "}";
-    unsigned char payload[55];
-    for (int i = 0; i < 55; i++) payload[i] = (unsigned char)i;
+    unsigned char payload[106];
+    for (int i = 0; i < 106; i++) payload[i] = (unsigned char)i;
     uint64_t header_length = sizeof(header) - 1;
     int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY | COMPAT_O_BINARY, 0600);
     if (fd < 0) return -1;
@@ -272,11 +278,12 @@ static int test_expert_store(void) {
 
     ColiDeepSeekV4ExpertStoreOptions options = {
         .model_dir = directory,
-        .layers = 1,
+        .layers = 2,
         .experts_per_layer = 1,
         .cache_bytes = 51,
         .pin_slots_per_layer = -1,
         .minimum_slots = 1,
+        .global_slots = 1,
     };
     ColiExpertStore *store = NULL;
     if (coli_deepseek_v4_expert_store_open(&options, &store,
@@ -308,6 +315,15 @@ static int test_expert_store(void) {
                   ((const unsigned char *)view.down.data)[0],
                   ((const unsigned char *)view.up.data)[0]); return 1; }
     coli_expert_release(store, &view);
+    /* 相同 expert id 的不同层必须覆盖全局槽，不能误判为缓存命中。 */
+    key = (ColiExpertKey){1, 0};
+    if (coli_expert_lookup(store, key, &view) != 0 ||
+        ((const unsigned char *)view.gate.scales)[0] != 55 ||
+        ((const unsigned char *)view.gate.data)[0] != 58 ||
+        ((const unsigned char *)view.down.data)[0] != 74 ||
+        ((const unsigned char *)view.up.data)[0] != 90)
+        return 1;
+    coli_expert_release(store, &view);
     {
         static const ColiExpertView zero;
         if (memcmp(&view, &zero, sizeof(view)) != 0) {
@@ -317,7 +333,10 @@ static int test_expert_store(void) {
     }
     /* Double release of a cleared view is a no-op. */
     coli_expert_release(store, &view);
-    if (coli_expert_lookup(store, key, &view) != 0) return 1;
+    key = (ColiExpertKey){0, 0};
+    if (coli_expert_lookup(store, key, &view) != 0 ||
+        ((const unsigned char *)view.gate.data)[0] != 7)
+        return 1;
     coli_expert_release(store, &view);
     /* Invalid key lookup must fail and clear the view. */
     memset(&view, 0x3c, sizeof(view));
@@ -331,8 +350,8 @@ static int test_expert_store(void) {
     }
     ColiExpertStoreStats stats;
     store->ops->stats(store, &stats);
-    if (stats.requests != 2 || stats.hits != 1 || stats.misses != 1 ||
-        stats.prefetched != 1 || stats.bytes_read != 51 ||
+    if (stats.requests != 3 || stats.hits != 0 || stats.misses != 3 ||
+        stats.prefetched != 1 || stats.bytes_read != 153 ||
         stats.resident_bytes != 51 || stats.capacity_bytes != 51)
         { fprintf(stderr, "expert stats mismatch: requests=%llu hits=%llu misses=%llu prefetched=%llu bytes=%llu resident=%llu capacity=%llu\n",
                   (unsigned long long)stats.requests,
@@ -706,7 +725,8 @@ static ColiDeepSeekV4ResourceInputs fixture(uint64_t available) {
 
 static int test_resource_plan(void) {
     char error[256];
-    ColiDeepSeekV4ResourcePlan low, high, capped, auto_24, capped_24, low_memory;
+    ColiDeepSeekV4ResourcePlan low, high, capped, auto_24, capped_24;
+    ColiDeepSeekV4ResourcePlan low_memory, disk_first;
     ColiDeepSeekV4ResourceInputs input = fixture(8 * GIB);
     if (coli_v4_resource_plan_compute(&low, &input, error, sizeof(error)) ||
         low.slots_per_layer < 6 || low.projected_bytes > 8 * GIB)
@@ -755,6 +775,22 @@ static int test_resource_plan(void) {
         low_memory.slots_per_layer != 1 ||
         low_memory.minimum_expert_bytes != 43 * UINT64_C(13369344) ||
         low_memory.projected_bytes > 5 * GIB)
+        return 1;
+
+    /* 磁盘优先模式忽略高于物理可用量的显式预算，并只保留全局单槽。 */
+    input = fixture(4 * GIB);
+    input.user_limit_bytes = 5 * GIB;
+    input.minimum_expert_slots = 1;
+    input.maximum_expert_slots = 1;
+    input.global_expert_slots = 1;
+    input.system_reserve_override_bytes = 128 * MIB;
+    if (coli_v4_resource_plan_compute(
+            &disk_first, &input, error, sizeof(error)) ||
+        disk_first.planner_available_bytes != 4 * GIB ||
+        disk_first.system_reserve_bytes != 128 * MIB ||
+        disk_first.slots_per_layer != 1 ||
+        disk_first.minimum_expert_bytes != UINT64_C(13369344) ||
+        disk_first.projected_bytes > 4 * GIB)
         return 1;
 
     ColiDeepSeekV4ResidentTierPlan tiers;

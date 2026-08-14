@@ -1536,7 +1536,7 @@ def main():
                         help="ignore a saved measured tuning profile")
     common.add_argument("--ctx",type=int,default=0)
     common.add_argument("--low-memory", action="store_true",
-                        help="DeepSeek V4：单槽 SSD 流式模式，并允许显式 Swap 预算")
+                        help="DeepSeek V4：全局单槽 SSD 流式模式，避免依赖系统 Swap")
     common.add_argument("--gpu",default=None,help="auto, none, or a device list such as 0,1")
     common.add_argument("--vram",type=float,default=0,help="total VRAM budget in GB (0=auto)")
     common.add_argument("--policy",choices=("quality","balanced","experimental-fast"),
