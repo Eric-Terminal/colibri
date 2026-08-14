@@ -404,6 +404,8 @@ def env_for_engine(a, arch):
         if a.ram: env["RAM_GB"] = str(a.ram)
     if arch == "deepseek_v4":
         if a.ctx: env["CTX"] = str(a.ctx)
+        if getattr(a, "low_memory", False):
+            env["COLI_V4_LOW_MEMORY"] = "1"
         # Speculation stays opt-in. Real multi-turn chat measured only 1/15
         # accepted prompt-lookup candidates; recurrent-state replay dominated
         # the visible decode. V4_DRAFT=5 remains available for repeated code.
@@ -1533,6 +1535,8 @@ def main():
     common.add_argument("--no-tune-profile",action="store_true",
                         help="ignore a saved measured tuning profile")
     common.add_argument("--ctx",type=int,default=0)
+    common.add_argument("--low-memory", action="store_true",
+                        help="DeepSeek V4：单槽 SSD 流式模式，并允许显式 Swap 预算")
     common.add_argument("--gpu",default=None,help="auto, none, or a device list such as 0,1")
     common.add_argument("--vram",type=float,default=0,help="total VRAM budget in GB (0=auto)")
     common.add_argument("--policy",choices=("quality","balanced","experimental-fast"),

@@ -712,16 +712,24 @@ int coli_v4_resource_plan_compute(
     ColiDeepSeekV4ResourcePlan *plan,
     const ColiDeepSeekV4ResourceInputs *inputs,
     char *error, size_t error_size) {
+    int minimum_slots = inputs && inputs->minimum_expert_slots > 0
+        ? inputs->minimum_expert_slots
+        : (inputs ? inputs->routed_topk : 0);
+    int maximum_slots = inputs && inputs->maximum_expert_slots > 0
+        ? inputs->maximum_expert_slots
+        : (inputs ? inputs->experts_per_layer : 0);
     if (!plan || !inputs || !inputs->available_bytes ||
         !inputs->maximum_layer_bytes || !inputs->expert_record_bytes ||
         inputs->sparse_layers < 1 || inputs->routed_topk < 1 ||
-        inputs->experts_per_layer < inputs->routed_topk)
+        inputs->experts_per_layer < inputs->routed_topk ||
+        minimum_slots < 1 || maximum_slots < minimum_slots ||
+        maximum_slots > inputs->experts_per_layer)
         return plan_error(error, error_size, "invalid V4 resource-plan inputs");
     memset(plan, 0, sizeof(*plan));
     plan->os_available_bytes = inputs->available_bytes;
     uint64_t available = inputs->available_bytes;
     int explicit_process_limit = inputs->user_limit_bytes &&
-        inputs->user_limit_bytes < available;
+        (inputs->allow_swap || inputs->user_limit_bytes < available);
     if (explicit_process_limit)
         available = inputs->user_limit_bytes;
     plan->planner_available_bytes = available;
@@ -742,7 +750,7 @@ int coli_v4_resource_plan_compute(
     uint64_t per_slot;
     if (multiply_u64((uint64_t)inputs->sparse_layers,
                      inputs->expert_record_bytes, &per_slot) ||
-        multiply_u64(per_slot, (uint64_t)inputs->routed_topk,
+        multiply_u64(per_slot, (uint64_t)minimum_slots,
                      &plan->minimum_expert_bytes))
         return plan_error(error, error_size, "V4 expert-cache size overflow");
 
@@ -758,10 +766,10 @@ int coli_v4_resource_plan_compute(
             usable / 1073741824.0);
 
     uint64_t slots = usable / per_slot;
-    if (slots > (uint64_t)inputs->experts_per_layer)
-        slots = (uint64_t)inputs->experts_per_layer;
-    if (slots < (uint64_t)inputs->routed_topk)
-        slots = (uint64_t)inputs->routed_topk;
+    if (slots > (uint64_t)maximum_slots)
+        slots = (uint64_t)maximum_slots;
+    if (slots < (uint64_t)minimum_slots)
+        slots = (uint64_t)minimum_slots;
     plan->slots_per_layer = (int)slots;
     if (multiply_u64(per_slot, slots, &plan->expert_cache_bytes) ||
         add_u64(fixed, plan->expert_cache_bytes, &plan->projected_bytes))
@@ -989,9 +997,17 @@ static int build_runtime_plan(ColiV4Engine *engine,
         return -1;
     }
     ColiDeepSeekV4ResourceInputs inputs = {
-        available, runtime->memory_limit_bytes, maximum_layer,
-        runtime_other, record, config.num_hidden_layers,
-        config.num_experts_per_tok, config.n_routed_experts,
+        .available_bytes = available,
+        .user_limit_bytes = runtime->memory_limit_bytes,
+        .maximum_layer_bytes = maximum_layer,
+        .runtime_other_bytes = runtime_other,
+        .expert_record_bytes = record,
+        .sparse_layers = config.num_hidden_layers,
+        .routed_topk = config.num_experts_per_tok,
+        .experts_per_layer = config.n_routed_experts,
+        .minimum_expert_slots = runtime->low_memory ? 1 : 0,
+        .maximum_expert_slots = runtime->low_memory ? 1 : 0,
+        .allow_swap = runtime->low_memory,
     };
     return coli_v4_resource_plan_compute(plan, &inputs, error, error_size);
 }
@@ -1024,6 +1040,12 @@ int coli_v4_expert_store_open_planned(
     ColiDeepSeekV4ResourcePlan plan;
     ColiDeepSeekV4RuntimeOptions *runtime = &engine->runtime;
     if (build_runtime_plan(engine, options, &plan, error, error_size)) return -1;
+    if (runtime->low_memory)
+        fprintf(stderr,
+                "v4_low_memory mode=single-slot-sync os_available=%.2fGiB "
+                "budget=%.2fGiB swap=allowed\n",
+                plan.os_available_bytes / (double)GIB,
+                plan.planner_available_bytes / (double)GIB);
     uint64_t per_slot = plan.expert_cache_bytes /
                         (uint64_t)plan.slots_per_layer;
     uint64_t head_bytes = 0, dense_bytes = 0;
@@ -1064,7 +1086,10 @@ int coli_v4_expert_store_open_planned(
     }
     int slots = (int)(cache_limit / per_slot);
     if (slots > plan.slots_per_layer) slots = plan.slots_per_layer;
-    if (slots < options->experts_per_layer && slots < 6) slots = 6;
+    int minimum_slots = options->minimum_slots > 0
+        ? options->minimum_slots
+        : (options->experts_per_layer < 6 ? options->experts_per_layer : 6);
+    if (slots < minimum_slots) slots = minimum_slots;
     plan.expert_cache_bytes = (uint64_t)slots * per_slot;
     runtime->target_expert_cache_bytes = plan.expert_cache_bytes;
     plan.projected_bytes = fixed + dense_bytes +
@@ -1085,6 +1110,7 @@ int coli_v4_expert_store_open_planned(
     automatic.cache_bytes = plan.expert_cache_bytes;
     automatic.pin_slots_per_layer = runtime->pin_slots_per_layer;
     automatic.repin_interval = runtime->repin_interval;
+    automatic.minimum_slots = minimum_slots;
     return coli_deepseek_v4_expert_store_open(
         &automatic, output, error, error_size);
 }
@@ -3734,7 +3760,7 @@ static int moe_token_pipeline(float *output,
     ExpertLoadJob jobs[DUAL_EXPERT_LOADER_MAX] = {{0}};
     ExpertLoadHandle loaders[DUAL_EXPERT_LOADER_MAX] = {{0}};
     int loader_active[DUAL_EXPERT_LOADER_MAX] = {0};
-    if (!result) {
+    if (!result && !coli_v4_low_memory_enabled()) {
         int preload = selected < dual_loader_lanes()
             ? selected : dual_loader_lanes();
         for (int i = 0; i < preload; i++) {
@@ -3752,7 +3778,7 @@ static int moe_token_pipeline(float *output,
     ExpertLoadJob job = {0};
     ExpertLoadHandle loader = {0};
     int loader_active = 0;
-    if (!result) {
+    if (!result && !coli_v4_low_memory_enabled()) {
         job.store = store;
         job.key = (ColiExpertKey){weights->plan.layer, expert_ids[0]};
         job.result = -1;
@@ -3771,6 +3797,28 @@ static int moe_token_pipeline(float *output,
         shared_output, &w1, &w2, &w3, input, config->swiglu_limit);
     if (!result) memset(output, 0, (size_t)d * sizeof(*output));
 
+    if (coli_v4_low_memory_enabled()) {
+        /*
+         * 单槽无法在当前专家仍被计算时预载下一个专家。同步读取、计算、
+         * 释放保持完整 top-k 数学路径，同时把匿名专家缓存压到一个槽位。
+         */
+        for (int current = 0; !result && current < selected; current++) {
+            ColiExpertView expert;
+            if (coli_expert_lookup(
+                    store,
+                    (ColiExpertKey){weights->plan.layer, expert_ids[current]},
+                    &expert)) {
+                result = -1;
+                break;
+            }
+            result = coli_v4_expert_forward_ref(
+                expert_output, &expert, input, expert_weights[current],
+                config->swiglu_limit);
+            coli_expert_release(store, &expert);
+            if (!result)
+                for (int i = 0; i < d; i++) output[i] += expert_output[i];
+        }
+    } else {
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
     for (int current = 0; !result && current < selected; current++) {
         int slot = current % dual_loader_lanes();
@@ -3848,6 +3896,7 @@ static int moe_token_pipeline(float *output,
         if (!job.result) coli_expert_release(store, &job.view);
     }
 #endif
+    }
     if (!result)
         for (int i = 0; i < d; i++)
             output[i] = coli_bf16_round(output[i] + shared_output[i]);
@@ -4039,6 +4088,29 @@ static int v4_moe_batch_union(
         if (used[expert])
             keys[key_count++] = (ColiExpertKey){weights->plan.layer, expert};
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
+    if (coli_v4_low_memory_enabled()) {
+        for (int current = 0; !result && current < key_count; current++) {
+            ColiExpertView view;
+            if (coli_expert_lookup(store, keys[current], &view)) {
+                result = -1;
+                break;
+            }
+            int expert = view.key.expert;
+            for (int item = 0; !result && item < batch; item++)
+                for (int rank = 0; !result && rank < topk; rank++) {
+                    if (indices[(size_t)item * topk + rank] != expert) continue;
+                    result = coli_v4_expert_forward_ref(
+                        expert_output, &view, inputs + (size_t)item * d,
+                        route_weights[(size_t)item * topk + rank],
+                        config->swiglu_limit);
+                    if (!result)
+                        for (int column = 0; column < d; column++)
+                            outputs[(size_t)item * d + column] +=
+                                expert_output[column];
+                }
+            coli_expert_release(store, &view);
+        }
+    } else {
     /* The union is also the loader pool's issue queue: keep lanes-many reads
      * in flight, launch the replacement before computing the completed
      * expert, and disk N+lanes overlaps CPU expert N. */
@@ -4096,6 +4168,7 @@ static int v4_moe_batch_union(
             profiled_expert_load_finish(&loaders[slot]);
             if (!jobs[slot].result) coli_expert_release(store, &jobs[slot].view);
         }
+    }
 #else
     for (int current = 0; !result && current < key_count; current++) {
         ColiExpertView view;
@@ -5691,7 +5764,9 @@ int coli_deepseek_v4_expert_store_open(
         lookup, release, prefetch, stats, destroy
     };
     if (!options || !output || !options->model_dir || options->layers < 1 ||
-        options->experts_per_layer < 1 || !options->cache_bytes)
+        options->experts_per_layer < 1 || !options->cache_bytes ||
+        options->minimum_slots < 0 ||
+        options->minimum_slots > options->experts_per_layer)
         return set_error(error, error_size, "invalid DeepSeek-V4 ExpertStore options");
     *output = NULL;
     ColiExpertStore *store = calloc(1, sizeof(*store));
@@ -5728,8 +5803,9 @@ int coli_deepseek_v4_expert_store_open(
     }
     state->slots_per_layer = (int)(options->cache_bytes /
         ((uint64_t)state->layers * state->record_bytes));
-    int minimum_slots = state->experts_per_layer < 6
-        ? state->experts_per_layer : 6;
+    int minimum_slots = options->minimum_slots > 0
+        ? options->minimum_slots
+        : (state->experts_per_layer < 6 ? state->experts_per_layer : 6);
     if (state->slots_per_layer < minimum_slots) {
         set_error(error, error_size,
                   "cache budget cannot hold %d active experts per layer "
@@ -6343,8 +6419,9 @@ int COLI_V4_ROWS16_STORE_OPEN(
             state->index, state->records[0].shard);
     fprintf(stderr, "v4_ssd_io mode=%s fallback=buffered-pread\n",
             direct_io ? "direct-aligned" : "buffered-pread");
-    int minimum_slots = state->experts_per_layer < 6
-        ? state->experts_per_layer : 6;
+    int minimum_slots = options->minimum_slots > 0
+        ? options->minimum_slots
+        : (state->experts_per_layer < 6 ? state->experts_per_layer : 6);
     int maximum_pins = state->slots_per_layer - minimum_slots;
 #ifndef COLI_V4_MAX_PIN_SLOTS_PER_LAYER
 #define COLI_V4_MAX_PIN_SLOTS_PER_LAYER 4
@@ -7024,6 +7101,7 @@ int coli_v4_engine_open(ColiV4Engine **output,
     engine->runtime.memory_limit_bytes = options->memory_limit_bytes;
     engine->runtime.context_tokens =
         options->context_tokens > 0 ? options->context_tokens : 4096;
+    engine->runtime.low_memory = coli_v4_low_memory_enabled();
     engine->runtime.repin_interval = options->repin_interval;
     engine->runtime.pin_slots_per_layer = options->pin_slots_per_layer;
 
@@ -7083,12 +7161,14 @@ int coli_v4_engine_open(ColiV4Engine **output,
     if (coli_v4_expert_store_open_planned(
             engine,
             &(ColiDeepSeekV4ExpertStoreOptions){
-                engine->runtime.target_model_dir,
-                engine->config.num_hidden_layers,
-                engine->config.n_routed_experts,
-                4ULL << 30,
-                engine->runtime.pin_slots_per_layer,
-                engine->runtime.repin_interval},
+                .model_dir = engine->runtime.target_model_dir,
+                .layers = engine->config.num_hidden_layers,
+                .experts_per_layer = engine->config.n_routed_experts,
+                .cache_bytes = 4ULL << 30,
+                .pin_slots_per_layer = engine->runtime.pin_slots_per_layer,
+                .repin_interval = engine->runtime.repin_interval,
+                .minimum_slots = engine->runtime.low_memory ? 1 : 0,
+            },
             &engine->experts, error, error_size))
         goto fail;
     engine->owns_experts = 1;
@@ -7514,8 +7594,11 @@ int main(int argc, char **argv) {
         coli_st_index_open(&index, argv[1], error, sizeof(error)) ||
         coli_deepseek_v4_expert_store_open(
             &(ColiDeepSeekV4ExpertStoreOptions){
-                argv[1], config.num_hidden_layers, config.n_routed_experts,
-                UINT64_C(4) * 1024 * 1024 * 1024, -1, 0,
+                .model_dir = argv[1],
+                .layers = config.num_hidden_layers,
+                .experts_per_layer = config.n_routed_experts,
+                .cache_bytes = UINT64_C(4) * 1024 * 1024 * 1024,
+                .pin_slots_per_layer = -1,
             }, &experts, error, sizeof(error))) {
         fprintf(stderr, "%s\n", error);
         return 1;
@@ -10155,7 +10238,9 @@ int coli_deepseek_v4_expert_store_open(
         lookup, release, prefetch, stats, destroy
     };
     if (!options || !output || !options->model_dir || options->layers < 1 ||
-        options->experts_per_layer < 1 || !options->cache_bytes)
+        options->experts_per_layer < 1 || !options->cache_bytes ||
+        options->minimum_slots < 0 ||
+        options->minimum_slots > options->experts_per_layer)
         return set_error(error, error_size, "invalid DeepSeek-V4 ExpertStore options");
     *output = NULL;
     ColiExpertStore *store = calloc(1, sizeof(*store));
@@ -10192,8 +10277,9 @@ int coli_deepseek_v4_expert_store_open(
     }
     state->slots_per_layer = (int)(options->cache_bytes /
         ((uint64_t)state->layers * state->record_bytes));
-    int minimum_slots = state->experts_per_layer < 6
-        ? state->experts_per_layer : 6;
+    int minimum_slots = options->minimum_slots > 0
+        ? options->minimum_slots
+        : (state->experts_per_layer < 6 ? state->experts_per_layer : 6);
     if (state->slots_per_layer < minimum_slots) {
         set_error(error, error_size,
                   "cache budget cannot hold %d active experts per layer "

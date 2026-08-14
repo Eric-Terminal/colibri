@@ -7,6 +7,8 @@
  */
 #include "deepseek_v4.h"
 
+#include <stdlib.h>
+
 #include "tensor.h"
 #include "expert_store.h"
 #include "native_quant.h"
@@ -21,6 +23,15 @@
 #ifndef COLI_V4_EXPERT_LOADER_COUNT
 #define COLI_V4_EXPERT_LOADER_COUNT 3
 #endif
+
+/*
+ * 低内存模式保留完整路由语义，只把专家加载退化为同步单槽流水线。
+ * 环境变量是刻意设置的显式开关：默认构建和默认执行路径保持不变。
+ */
+static inline int coli_v4_low_memory_enabled(void) {
+    const char *value = getenv("COLI_V4_LOW_MEMORY");
+    return value && *value && atoi(value) != 0;
+}
 
 #define COLI_ST_MAX_RANK ST_MAX_RANK
 #define COLI_ST_BF16 0
@@ -507,6 +518,8 @@ typedef struct {
     /* Optional hot-pin policy (-1 / 0 => implementation default). */
     int pin_slots_per_layer;
     uint64_t repin_interval;
+    /* 0 => 使用模型 top-k；低内存模式传 1。 */
+    int minimum_slots;
 } ColiDeepSeekV4ExpertStoreOptions;
 
 int coli_deepseek_v4_expert_store_open(
@@ -580,6 +593,11 @@ typedef struct {
     int sparse_layers;
     int routed_topk;
     int experts_per_layer;
+    /* 0 分别表示 routed_topk / experts_per_layer。 */
+    int minimum_expert_slots;
+    int maximum_expert_slots;
+    /* 允许显式预算高于当前可用物理内存，由操作系统负责压缩和换页。 */
+    int allow_swap;
 } ColiDeepSeekV4ResourceInputs;
 
 typedef struct {
@@ -636,6 +654,7 @@ typedef struct {
     const char *target_model_dir;
     uint64_t memory_limit_bytes;
     int context_tokens;
+    int low_memory;
     int dense_resident;
     uint64_t target_expert_cache_bytes;
     int pin_slots_per_layer;

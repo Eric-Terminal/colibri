@@ -65,6 +65,25 @@ python ./coli serve --model /path/to/DeepSeek-V4-Flash --ram 32
 python ./coli web --model /path/to/DeepSeek-V4-Flash --ram 32
 ```
 
+### 低内存 SSD 流式模式
+
+内存不足 16 GB、但模型位于高速 SSD 时，可以显式启用单槽流式模式：
+
+```bash
+python ./coli run --model /path/to/DeepSeek-V4-Flash \
+  --low-memory --ram 3 --ctx 256 --ngen 8 \
+  "请只回答两个字：你好"
+```
+
+该模式仍然计算模型路由选中的全部 top-k 专家，不改变模型精度或路由语义。
+区别是每层只保留一个专家槽位，并在当前专家计算完成后同步从 SSD 读取下一
+个专家。这样会降低内存占用，但同时失去并行预读和专家缓存命中，生成速度会
+明显下降。
+
+`--low-memory` 还允许显式 `--ram` 预算高于操作系统报告的当前可用物理内存，
+因此 macOS、Linux 或 Windows 可能使用压缩内存或 Swap。该行为只在明确传入
+低内存开关时启用；默认规划和默认并行加载路径保持不变。
+
 V4 chat 使用模型原生标记。原生服务当前只支持 greedy 和一个活动 KV slot，
 tools 与 grammar 会被拒绝。请求会重新 prefill，但进程、权重、dense、
 head 与专家缓存会保持热状态。

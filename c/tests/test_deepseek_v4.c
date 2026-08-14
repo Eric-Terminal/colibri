@@ -271,7 +271,12 @@ static int test_expert_store(void) {
     if (write_fixture(path) != 0) { perror("write_fixture"); return 1; }
 
     ColiDeepSeekV4ExpertStoreOptions options = {
-        directory, 1, 1, 51, -1, 0
+        .model_dir = directory,
+        .layers = 1,
+        .experts_per_layer = 1,
+        .cache_bytes = 51,
+        .pin_slots_per_layer = -1,
+        .minimum_slots = 1,
     };
     ColiExpertStore *store = NULL;
     if (coli_deepseek_v4_expert_store_open(&options, &store,
@@ -688,15 +693,20 @@ static int test_prompt(void) {
 
 static ColiDeepSeekV4ResourceInputs fixture(uint64_t available) {
     ColiDeepSeekV4ResourceInputs input = {
-        available, 0, 160 * MIB, 600 * MIB, 13369344,
-        43, 6, 256,
+        .available_bytes = available,
+        .maximum_layer_bytes = 160 * MIB,
+        .runtime_other_bytes = 600 * MIB,
+        .expert_record_bytes = 13369344,
+        .sparse_layers = 43,
+        .routed_topk = 6,
+        .experts_per_layer = 256,
     };
     return input;
 }
 
 static int test_resource_plan(void) {
     char error[256];
-    ColiDeepSeekV4ResourcePlan low, high, capped, auto_24, capped_24;
+    ColiDeepSeekV4ResourcePlan low, high, capped, auto_24, capped_24, low_memory;
     ColiDeepSeekV4ResourceInputs input = fixture(8 * GIB);
     if (coli_v4_resource_plan_compute(&low, &input, error, sizeof(error)) ||
         low.slots_per_layer < 6 || low.projected_bytes > 8 * GIB)
@@ -727,6 +737,24 @@ static int test_resource_plan(void) {
         return 1;
     input = fixture(4 * GIB);
     if (coli_v4_resource_plan_compute(&capped, &input, error, sizeof(error)) == 0)
+        return 1;
+
+    /*
+     * 低内存模式由用户显式接受换页：5 GiB 预算可以高于当前 4 GiB
+     * 可用物理内存，但专家缓存必须严格限制为每层一个槽位。
+     */
+    input = fixture(4 * GIB);
+    input.user_limit_bytes = 5 * GIB;
+    input.minimum_expert_slots = 1;
+    input.maximum_expert_slots = 1;
+    input.allow_swap = 1;
+    if (coli_v4_resource_plan_compute(
+            &low_memory, &input, error, sizeof(error)) ||
+        low_memory.planner_available_bytes != 5 * GIB ||
+        low_memory.system_reserve_bytes != 0 ||
+        low_memory.slots_per_layer != 1 ||
+        low_memory.minimum_expert_bytes != 43 * UINT64_C(13369344) ||
+        low_memory.projected_bytes > 5 * GIB)
         return 1;
 
     ColiDeepSeekV4ResidentTierPlan tiers;

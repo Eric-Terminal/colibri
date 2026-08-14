@@ -116,6 +116,12 @@ class V4CliTest(unittest.TestCase):
         self.assertEqual(env["RAM_GB"], "64")
         self.assertEqual(env["CTX"], "4096")
 
+    def test_v4_low_memory_mode_is_explicit(self):
+        args = argparse.Namespace(
+            ngen=8, temp=0.0, ram=5, ctx=256, low_memory=True)
+        env = self.cli.env_for_engine(args, "deepseek_v4")
+        self.assertEqual(env["COLI_V4_LOW_MEMORY"], "1")
+
     def test_kimi_engine_environment_forwards_ram(self):
         """#855: `--ram` reached the environment for deepseek_v4 only, so on Kimi
         K3 it was set and never read -- the flag a user reaches for to bound
