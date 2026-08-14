@@ -811,6 +811,55 @@ static int test_resource_plan(void) {
 }
 /* ==== end test_deepseek_v4_resource_plan.c ==== */
 
+/* ==== begin test_deepseek_v4_sampling.c ==== */
+static int test_sampling(void) {
+    float logits[] = {4.0f, 2.0f, 0.0f, -INFINITY};
+    uint64_t greedy_seed = 17, before = greedy_seed;
+    int token = -1;
+    float logit = 0.0f;
+    if (coli_v4_sample_logits(logits, 4, 0.0f, 1.0f, &greedy_seed,
+                              &token, &logit) ||
+        token != 0 || logit != 4.0f || greedy_seed != before)
+        return 1;
+
+    /* top-p 阈值落在首个候选内时，任何随机种子都只能选择 top-1。 */
+    for (uint64_t seed_value = 1; seed_value <= 32; seed_value++) {
+        uint64_t seed = seed_value;
+        if (coli_v4_sample_logits(logits, 4, 1.0f, 0.8f, &seed,
+                                  &token, &logit) ||
+            token != 0 || logit != 4.0f)
+            return 1;
+    }
+
+    /* 固定 SEED 必须复现同一序列，同时完整分布不能退化成 argmax。 */
+    float equal[] = {0.0f, 0.0f, -INFINITY};
+    uint64_t left_seed = 1234, right_seed = 1234;
+    int seen = 0;
+    for (int item = 0; item < 64; item++) {
+        int left = -1, right = -1;
+        float left_logit = 1.0f, right_logit = 1.0f;
+        if (coli_v4_sample_logits(equal, 3, 1.0f, 1.0f, &left_seed,
+                                  &left, &left_logit) ||
+            coli_v4_sample_logits(equal, 3, 1.0f, 1.0f, &right_seed,
+                                  &right, &right_logit) ||
+            left != right || left_logit != 0.0f || right_logit != 0.0f ||
+            left < 0 || left > 1)
+            return 1;
+        seen |= 1 << left;
+    }
+    if (seen != 3) return 1;
+
+    uint64_t bad_seed = 1;
+    if (!coli_v4_sample_logits(equal, 3, 1.0f, 0.0f, &bad_seed,
+                               &token, &logit) ||
+        !coli_v4_sample_logits((float[]){NAN, INFINITY}, 2, 1.0f, 1.0f,
+                               &bad_seed, &token, &logit))
+        return 1;
+    puts("DeepSeek-V4 sampling tests: ok");
+    return 0;
+}
+/* ==== end test_deepseek_v4_sampling.c ==== */
+
 /* ==== begin test_deepseek_v4_sparse_attention.c ==== */
 /* umbrella headers */
 /* shared */
@@ -877,6 +926,10 @@ int main(int argc, char **argv) {
     }
     if (test_resource_plan() != 0) {
         fprintf(stderr, "FAIL: test_resource_plan\n");
+        return 1;
+    }
+    if (test_sampling() != 0) {
+        fprintf(stderr, "FAIL: test_sampling\n");
         return 1;
     }
     if (test_sparse_attention() != 0) {

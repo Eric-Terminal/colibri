@@ -91,9 +91,14 @@ M1 8 GB、167 GB Flash 检查点的真实测试中，Chat 模板首 token 用时
 `/usr/bin/time -l` 报告最大 RSS 约 251 MiB、`swaps` 为 0。该数字只描述一次
 本机测量，不是其他硬件的性能承诺。
 
-V4 chat 使用模型原生标记。原生服务当前只支持 greedy 和一个活动 KV slot，
-tools 与 grammar 会被拒绝。请求会重新 prefill，但进程、权重、dense、
-head 与专家缓存会保持热状态。
+V4 chat 使用模型原生标记。Web/OpenAI API 的 `temperature` 与 `top_p` 会进入
+目标模型采样；`temperature=0` 保留原先确定性的 greedy。采样模式不会启用
+当前只支持 argmax 验证的 DSpark/提示词投机路径，避免改变目标分布。设置
+`SEED` 可以复现随机序列。低内存模式只额外保留不到数 MiB 的全词表 logit
+和候选数组，BF16 输出头仍从模型盘分块读取。
+
+原生服务当前只支持一个活动 KV slot，tools 与 grammar 会被拒绝。请求会重新
+prefill，但进程、权重、dense、head 与专家缓存会保持热状态。
 
 ## 验证
 
@@ -104,8 +109,9 @@ python -m pip install -r tools/requirements-deepseek-v4-tiny.txt
 make deepseek-v4-tiny-check
 ```
 
-测试覆盖加载、teacher forcing、greedy decode、长/重复 session、
-`--no-dspark` 兼容，以及持久化 `SUBMIT`/`DATA`/`DONE` 协议中的两次请求。
+测试覆盖加载、teacher forcing、greedy decode、Temperature/Top-p 采样、固定
+种子复现、长/重复 session、`--no-dspark` 兼容，以及持久化
+`SUBMIT`/`DATA`/`DONE` 协议中的多次请求。
 
 真实 checkpoint 可运行：
 
@@ -119,6 +125,6 @@ make deepseek-v4-oracle MODEL=/path/to/DeepSeek-V4-Flash \
 
 ## 后续工作
 
-- 增加非 greedy 采样与更多服务 slot。
+- 增加更多服务 slot。
 - 上游提供常驻 rows16 API 后，删除剩余的 V4 私有 rows16 缓存布局。
 - stacked PR 恢复 DSpark 时必须保持目标 token 不变，并提供开关性能与接受率数据。

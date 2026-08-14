@@ -1124,9 +1124,100 @@ int coli_v4_expert_store_open_planned(
 /* ######## deepseek_v4_math.c ######## */
 #include "deepseek_v4_internal.h"
 
+#include <float.h>
 #include <limits.h>
 #include <math.h>
 #include <stdlib.h>
+
+typedef struct {
+    float weight;
+    int token;
+} V4SampleCandidate;
+
+static int v4_sample_candidate_compare(const void *left, const void *right) {
+    const V4SampleCandidate *a = left, *b = right;
+    if (a->weight < b->weight) return 1;
+    if (a->weight > b->weight) return -1;
+    return (a->token > b->token) - (a->token < b->token);
+}
+
+static double v4_rng_uniform(uint64_t *state) {
+    uint64_t value = *state;
+    if (!value) value = UINT64_C(0x9e3779b97f4a7c15);
+    value ^= value << 13;
+    value ^= value >> 7;
+    value ^= value << 17;
+    *state = value;
+    return (double)(value >> 11) * (1.0 / 9007199254740992.0);
+}
+
+int coli_v4_sample_logits(const float *logits, int vocab, float temperature,
+                          float top_p, uint64_t *rng_state,
+                          int *token, float *logit) {
+    if (!logits || vocab < 1 || !isfinite(temperature) || temperature < 0.0f ||
+        temperature > 2.0f || !isfinite(top_p) || top_p <= 0.0f ||
+        top_p > 1.0f || !rng_state || !token || !logit)
+        return -1;
+
+    int maximum_token = -1;
+    float maximum = -FLT_MAX;
+    for (int item = 0; item < vocab; item++)
+        if (isfinite(logits[item]) &&
+            (maximum_token < 0 || logits[item] > maximum)) {
+            maximum = logits[item];
+            maximum_token = item;
+        }
+    if (maximum_token < 0) return -1;
+    if (temperature == 0.0f) {
+        *token = maximum_token;
+        *logit = maximum;
+        return 0;
+    }
+
+    V4SampleCandidate *candidates = malloc(
+        (size_t)vocab * sizeof(*candidates));
+    if (!candidates) return -1;
+    double total = 0.0;
+    for (int item = 0; item < vocab; item++) {
+        float weight = isfinite(logits[item])
+            ? (float)exp(((double)logits[item] - maximum) / temperature)
+            : 0.0f;
+        candidates[item] = (V4SampleCandidate){weight, item};
+        total += weight;
+    }
+    if (!isfinite(total) || total <= 0.0) {
+        free(candidates);
+        return -1;
+    }
+
+    int count = vocab;
+    double mass = total;
+    if (top_p < 1.0f) {
+        qsort(candidates, (size_t)vocab, sizeof(*candidates),
+              v4_sample_candidate_compare);
+        double threshold = total * top_p;
+        mass = 0.0;
+        count = 0;
+        do {
+            mass += candidates[count++].weight;
+        } while (count < vocab && mass < threshold);
+    }
+
+    double draw = v4_rng_uniform(rng_state) * mass;
+    double cumulative = 0.0;
+    int selected = candidates[count - 1].token;
+    for (int item = 0; item < count; item++) {
+        cumulative += candidates[item].weight;
+        if (draw < cumulative) {
+            selected = candidates[item].token;
+            break;
+        }
+    }
+    free(candidates);
+    *token = selected;
+    *logit = logits[selected];
+    return 0;
+}
 
 static float sigmoidf_stable(float value) {
     if (value >= 0.0f) {
@@ -7499,6 +7590,66 @@ static int head_argmax(ColiV4Engine *engine, const float *hidden,
     return winner < 0 ? -1 : 0;
 }
 
+static int head_logits(ColiV4Engine *engine, const float *hidden,
+                       const ColiSafetensorsIndex *index,
+                       const ColiDeepSeekV4Config *config, float *scores) {
+    const ColiSafetensorsTensor *head = coli_st_find(index, "head.weight");
+    int d = config->hidden_size, vocab = config->vocab_size;
+    if (!head || head->dtype != COLI_ST_BF16 || d < 1 || vocab < 1 || !scores)
+        return -1;
+    int shard = coli_st_tensor_shard(index, head);
+    const uint16_t *resident = coli_v4_head_cache_data(
+        engine, shard, (uint64_t)head->off,
+        (size_t)vocab * d * sizeof(uint16_t));
+    if (resident) {
+        #pragma omp parallel for schedule(static)
+        for (int row = 0; row < vocab; row++)
+            scores[row] = head_bf16_dot(
+                resident + (size_t)row * d, hidden, d);
+        return 0;
+    }
+
+    /* 磁盘优先模式只额外保留全词表 logit；BF16 输出头仍按小块读取。 */
+    enum { ROWS = 64 };
+    uint16_t *raw = malloc((size_t)ROWS * d * sizeof(*raw));
+    if (!raw) return -1;
+    for (int start = 0; start < vocab; start += ROWS) {
+        int rows = vocab - start < ROWS ? vocab - start : ROWS;
+        size_t bytes = (size_t)rows * d * sizeof(*raw);
+        if (coli_st_read_at_engine(
+                engine, index, shard,
+                (uint64_t)head->off + (uint64_t)start * d * sizeof(*raw),
+                bytes, raw)) {
+            free(raw);
+            return -1;
+        }
+        #pragma omp parallel for schedule(static)
+        for (int row = 0; row < rows; row++)
+            scores[start + row] = head_bf16_dot(
+                raw + (size_t)row * d, hidden, d);
+    }
+    free(raw);
+    return 0;
+}
+
+static int head_pick(ColiV4Engine *engine, const float *hidden,
+                     const ColiSafetensorsIndex *index,
+                     const ColiDeepSeekV4Config *config,
+                     float temperature, float top_p, uint64_t *rng_state,
+                     int *token, float *logit) {
+    if (temperature == 0.0f)
+        return head_argmax(engine, hidden, index, config, token, logit);
+    float *scores = malloc((size_t)config->vocab_size * sizeof(*scores));
+    if (!scores) return -1;
+    int result = head_logits(engine, hidden, index, config, scores);
+    if (!result)
+        result = coli_v4_sample_logits(
+            scores, config->vocab_size, temperature, top_p,
+            rng_state, token, logit);
+    free(scores);
+    return result ? -1 : 0;
+}
+
 static int head_argmax_batch(ColiV4Engine *engine, const float *hidden,
                              const ColiSafetensorsIndex *index,
                              const ColiDeepSeekV4Config *config, int batch,
@@ -8229,6 +8380,19 @@ int coli_v4_session_create(ColiV4Session **output, ColiV4Engine *engine,
         return -1;
     }
     session->engine = engine;
+    const char *seed_text = getenv("SEED");
+    if (seed_text) {
+        session->rng_state = (uint64_t)atoll(seed_text) *
+            UINT64_C(0x9e3779b97f4a7c15) + 1;
+    } else {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        session->rng_state = UINT64_C(0x9e3779b97f4a7c15) ^
+            ((uint64_t)now.tv_sec << 32) ^ (uint64_t)now.tv_nsec ^
+            (uint64_t)(uintptr_t)session;
+        if (!session->rng_state)
+            session->rng_state = UINT64_C(0x9e3779b97f4a7c15);
+    }
     coli_v4_engine_attach_session(engine);
     session->config = *coli_v4_engine_config(engine);
     session->max_prompt_tokens =
@@ -8413,6 +8577,16 @@ int coli_v4_session_generate(ColiV4Session *session,
     session->spec_accepted = 0;
     session->spec_disabled = 0;
 
+    float temperature = options->temperature;
+    float top_p = options->top_p == 0.0f ? 1.0f : options->top_p;
+    if (!isfinite(temperature) || temperature < 0.0f || temperature > 2.0f ||
+        !isfinite(top_p) || top_p <= 0.0f || top_p > 1.0f) {
+        if (error && error_size)
+            snprintf(error, error_size, "invalid V4 sampling parameters");
+        return -1;
+    }
+    int sampling = temperature > 0.0f;
+
     int max_new = options->max_new_tokens;
     if (max_new > session->max_new_tokens_cap)
         max_new = session->max_new_tokens_cap;
@@ -8499,7 +8673,8 @@ int coli_v4_session_generate(ColiV4Session *session,
     int current = 0;
     float current_logit = 0.0f;
     if (final_hidden(hidden, last, index, config, error, error_size) ||
-        head_argmax(engine, hidden, index, config, &current, &current_logit)) {
+        head_pick(engine, hidden, index, config, temperature, top_p,
+                  &session->rng_state, &current, &current_logit)) {
         kv_prefix_taint(&session->fed);
         return -1;
     }
@@ -8525,7 +8700,9 @@ int coli_v4_session_generate(ColiV4Session *session,
 
     while (!done && generated_count < max_new) {
         int remaining = max_new - generated_count;
-        if (!options->no_dspark && !session->spec_disabled && remaining >= 3) {
+        /* 当前投机验证比较的是 target argmax；采样时启用会改变目标分布。 */
+        if (!sampling && !options->no_dspark && !session->spec_disabled &&
+            remaining >= 3) {
             int inputs[25] = {0}, drafts[24] = {0};
             int predictions[25] = {0};
             float logits[25] = {0};
@@ -8737,13 +8914,14 @@ int coli_v4_session_generate(ColiV4Session *session,
             return -1;
         }
         /* `current` is now in the attention state at `position`. Record it here,
-         * before head_argmax overwrites it: the token generated last is never
+         * before head_pick overwrites it: the token generated last is never
          * fed, so recording after the loop would claim one token too many. */
         kv_prefix_record(&session->fed, &current, position, 1);
         session->state = state;
         session->next = next;
         if (final_hidden(hidden, state, index, config, error, error_size) ||
-            head_argmax(engine, hidden, index, config, &current, &current_logit)) {
+            head_pick(engine, hidden, index, config, temperature, top_p,
+                      &session->rng_state, &current, &current_logit)) {
             kv_prefix_taint(&session->fed);
             return -1;
         }
@@ -9136,13 +9314,6 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
         v4_serve_error(request->id, "unsupported request extension");
         return;
     }
-    if (request->temperature != 0.0f)
-        fprintf(stderr, "[V4] temperature %.3g ignored; target engine is greedy\n",
-                request->temperature);
-    if (request->top_p != 1.0f)
-        fprintf(stderr, "[V4] top_p %.3g ignored; target engine is greedy\n",
-                request->top_p);
-
     int prompt_count = tok_encode(&session->tokenizer, request->prompt,
                                   request->prompt_bytes, session->prompt_ids,
                                   session->max_prompt_tokens + 16);
@@ -9200,6 +9371,8 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
             .max_new_tokens = request->max_tokens,
             .stop_at_sentence = 0,
             .no_dspark = 0,
+            .temperature = request->temperature,
+            .top_p = request->top_p,
         },
         v4_serve_token, &stream, &stats, error, sizeof(error));
     double elapsed = spec_now() - started;

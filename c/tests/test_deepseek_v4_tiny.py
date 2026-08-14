@@ -180,13 +180,15 @@ def check_session(
 
 
 def check_serve(binary: Path, model: Path, case: dict[str, object]) -> None:
+    seeded_env = dict(os.environ, CTX="128", SEED="1")
     engine = openai_server.Engine(
         binary,
         model,
         max_tokens=int(case["max_new_tokens"]),
-        env=dict(os.environ, CTX="128"),
+        env=seeded_env,
         kv_slots=1,
     )
+    sampled = ""
     try:
         expected = token_prompt(case["greedy_new_ids"])
         for ordinal in range(2):
@@ -205,9 +207,32 @@ def check_serve(binary: Path, model: Path, case: dict[str, object]) -> None:
                 )
             if stats["prompt_tokens"] != len(case["prompt_ids"]):
                 raise AssertionError(f"serve round {ordinal}: bad prompt stats {stats}")
+        pieces = []
+        engine.generate(
+            token_prompt(case["prompt_ids"]), 1, 1.0, 1.0, pieces.append,
+        )
+        sampled = "".join(pieces)
     finally:
         engine.close()
-    print("PASS target serve: persistent SUBMIT/DATA/DONE protocol is token-exact")
+
+    replay = openai_server.Engine(
+        binary, model, max_tokens=1, env=seeded_env, kv_slots=1,
+    )
+    try:
+        pieces = []
+        replay.generate(
+            token_prompt(case["prompt_ids"]), 1, 1.0, 1.0, pieces.append,
+        )
+        replayed = "".join(pieces)
+    finally:
+        replay.close()
+    greedy_first = token_prompt(case["greedy_new_ids"][:1])
+    if sampled != replayed or sampled == greedy_first:
+        raise AssertionError(
+            f"seeded sampling did not reach the V4 engine: "
+            f"sample={sampled!r}, replay={replayed!r}, greedy={greedy_first!r}"
+        )
+    print("PASS target serve: greedy exact; seeded sampling is effective and repeatable")
 
 
 def check_cli_uses_engine_context(binary: Path, model: Path, temporary: Path) -> None:

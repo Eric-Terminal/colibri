@@ -738,7 +738,13 @@ struct ColiV4Session {
     uint64_t spec_drafted;
     uint64_t spec_accepted;
     int spec_disabled;
+    uint64_t rng_state;
 };
+
+/* 纯采样入口供生成路径与单元测试共用；不读取或修改模型状态。 */
+int coli_v4_sample_logits(const float *logits, int vocab, float temperature,
+                          float top_p, uint64_t *rng_state,
+                          int *token, float *logit);
 
 /* RAM-tiered expert open used by coli_v4_engine_open (replaces ld --wrap). */
 int coli_v4_expert_store_open_planned(
