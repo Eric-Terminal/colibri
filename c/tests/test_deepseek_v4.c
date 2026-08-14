@@ -806,10 +806,73 @@ static int test_resource_plan(void) {
             &tiers, &target_only, error, sizeof(error)) ||
         tiers.dense_resident || tiers.dense_bytes)
         return 1;
+
+    ColiDeepSeekV4Config context_config = {
+        .num_hidden_layers = 3,
+        .head_dim = 4,
+        .sliding_window = 8,
+        .index_head_dim = 2,
+        .max_position_embeddings = 1048576,
+        .compress_ratio_count = 3,
+        .compress_ratios = {0, 4, 128},
+    };
+    uint64_t full_context = coli_v4_context_reserve_bytes(
+        &context_config, 1048576, 0);
+    uint64_t lazy_context = coli_v4_context_reserve_bytes(
+        &context_config, 1048576, 1);
+    if (full_context != UINT64_C(6422912) ||
+        lazy_context != UINT64_C(1920) || lazy_context >= full_context)
+        return 1;
     puts("DeepSeek V4 resource plan tests: ok");
     return 0;
 }
 /* ==== end test_deepseek_v4_resource_plan.c ==== */
+
+/* ==== begin test_deepseek_v4_context_storage.c ==== */
+static int test_context_storage(void) {
+    char error[256] = {0};
+    void *storage = NULL;
+    size_t storage_bytes = 0;
+    int fd = -1;
+#ifndef _WIN32
+    char directory[] = "/tmp/coli-v4-context-test-XXXXXX";
+    if (!mkdtemp(directory) ||
+        setenv("COLI_V4_LOW_MEMORY", "1", 1) ||
+        setenv("COLI_V4_CONTEXT_DIR", directory, 1))
+        return 1;
+#endif
+    if (coli_v4_context_storage_create(
+            &storage, 4096, 8192, &storage_bytes, &fd,
+            error, sizeof(error)))
+        return 1;
+#ifndef _WIN32
+    if (fd >= -1 || storage_bytes != 8192) return 1;
+#else
+    if (fd != -1 || storage_bytes != 4096) return 1;
+#endif
+    unsigned char *bytes = storage;
+    for (size_t item = 0; item < 4096; item++) bytes[item] = (unsigned char)item;
+#ifdef _WIN32
+    if (coli_v4_context_storage_resize(
+            &storage, storage_bytes, 8192, fd, error, sizeof(error)))
+        return 1;
+    storage_bytes = 8192;
+#endif
+    bytes = storage;
+    for (size_t item = 0; item < 4096; item++)
+        if (bytes[item] != (unsigned char)item) return 1;
+    for (size_t item = 4096; item < 8192; item++)
+        if (bytes[item]) return 1;
+    coli_v4_context_storage_destroy(storage, storage_bytes, fd);
+#ifndef _WIN32
+    unsetenv("COLI_V4_CONTEXT_DIR");
+    unsetenv("COLI_V4_LOW_MEMORY");
+    if (rmdir(directory)) return 1;
+#endif
+    puts("DeepSeek-V4 context storage tests: ok");
+    return 0;
+}
+/* ==== end test_deepseek_v4_context_storage.c ==== */
 
 /* ==== begin test_deepseek_v4_sampling.c ==== */
 static int test_sampling(void) {
@@ -926,6 +989,10 @@ int main(int argc, char **argv) {
     }
     if (test_resource_plan() != 0) {
         fprintf(stderr, "FAIL: test_resource_plan\n");
+        return 1;
+    }
+    if (test_context_storage() != 0) {
+        fprintf(stderr, "FAIL: test_context_storage\n");
         return 1;
     }
     if (test_sampling() != 0) {

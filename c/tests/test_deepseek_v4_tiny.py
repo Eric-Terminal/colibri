@@ -180,7 +180,13 @@ def check_session(
 
 
 def check_serve(binary: Path, model: Path, case: dict[str, object]) -> None:
-    seeded_env = dict(os.environ, CTX="128", SEED="1")
+    seeded_env = dict(
+        os.environ,
+        CTX="1048576",
+        SEED="1",
+        COLI_V4_LOW_MEMORY="1",
+        COLI_V4_CONTEXT_DIR=str(model),
+    )
     engine = openai_server.Engine(
         binary,
         model,

@@ -71,7 +71,7 @@ python ./coli web --model /path/to/DeepSeek-V4-Flash --ram 32
 
 ```bash
 python ./coli run --model /path/to/DeepSeek-V4-Flash \
-  --low-memory --ram 3 --ctx 256 --ngen 8 \
+  --low-memory --ram 3 --ctx 1048576 --ngen 8 \
   "请只回答两个字：你好"
 ```
 
@@ -82,7 +82,19 @@ python ./coli run --model /path/to/DeepSeek-V4-Flash \
 
 Prompt Prefill 使用最多 32 token 的分块工作区，而不是按照整个 `--ctx` 预留
 两块激活数组。可以通过 `COLI_V4_PREFILL_CHUNK=25..64` 调整分块；较大的分块
-可能提高 Prefill 吞吐，但会增加内存。长期压缩注意力状态仍保留在内存中。
+可能提高 Prefill 吞吐，但会增加内存。
+
+低内存模式中的 `--ctx` 是会话可达到的上限，不再是启动时一次性分配的 KV
+大小。滑动窗口、压缩 KV 与 Indexer 从最小容量开始，逻辑容量随 token 数翻倍
+增长。`coli` 会在模型目录创建立即取消目录项的稀疏临时文件，并将长期压缩
+状态映射到模型所在卷；文件描述符会在映射后关闭，磁盘块只在对应页面首次
+写入时分配。直接启动 engine 时，可以用 `COLI_V4_CONTEXT_DIR` 指定后备目录。
+
+官方 1M 配置完整增长后约需要 13.45 GiB 的文件后备状态，但启动只计入约
+13.34 MiB 的初始上下文工作集。Indexer 选中历史 token 后，注意力只把选中的
+KV 行读入临时缓冲，不会再把整段磁盘历史复制回匿名内存。1M 表示引擎允许
+会话逐步增长到该上限，并不表示百万 token 推理会很快；实际磁盘占用与计算
+时间仍会随对话长度上升。
 
 低内存规划不会接受高于操作系统当前可用内存的 `--ram` 预算，并会保留系统
 余量，避免主动依赖压缩内存或 Swap。默认规划和默认并行加载路径保持不变。
@@ -97,6 +109,11 @@ V4 chat 使用模型原生标记。Web/OpenAI API 的 `temperature` 与 `top_p` 
 `SEED` 可以复现随机序列。低内存模式只额外保留不到数 MiB 的全词表 logit
 和候选数组，BF16 输出头仍从模型盘分块读取。
 
+低内存模式会关闭需要复制完整注意力历史的投机快照。文件后备页面仍会进入
+操作系统文件缓存，瞬时激活与系统中其他进程也仍可能触发 Swap；该模式避免
+的是把长期压缩上下文作为匿名内存主动压入内置盘 Swap，而不是承诺系统的
+Swap 数字永远为零。
+
 原生服务当前只支持一个活动 KV slot，tools 与 grammar 会被拒绝。请求会重新
 prefill，但进程、权重、dense、head 与专家缓存会保持热状态。
 
@@ -110,7 +127,8 @@ make deepseek-v4-tiny-check
 ```
 
 测试覆盖加载、teacher forcing、greedy decode、Temperature/Top-p 采样、固定
-种子复现、长/重复 session、`--no-dspark` 兼容，以及持久化
+种子复现、1M 上下文懒启动与文件后备扩容、长/重复 session、
+`--no-dspark` 兼容，以及持久化
 `SUBMIT`/`DATA`/`DONE` 协议中的多次请求。
 
 真实 checkpoint 可运行：

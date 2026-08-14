@@ -33,6 +33,19 @@ static inline int coli_v4_low_memory_enabled(void) {
     return value && *value && atoi(value) != 0;
 }
 
+/*
+ * 低内存上下文使用模型盘上的匿名稀疏文件承载可增长数组。文件在映射后
+ * 立即关闭，磁盘块只会随页面写入分配；调用方保存实际映射长度用于释放。
+ */
+int coli_v4_context_storage_create(void **data, size_t initial_bytes,
+                                   size_t maximum_bytes,
+                                   size_t *allocated_bytes, int *fd,
+                                   char *error, size_t error_size);
+int coli_v4_context_storage_resize(void **data, size_t old_bytes,
+                                   size_t new_bytes, int fd,
+                                   char *error, size_t error_size);
+void coli_v4_context_storage_destroy(void *data, size_t bytes, int fd);
+
 #define COLI_ST_MAX_RANK ST_MAX_RANK
 #define COLI_ST_BF16 0
 #define COLI_ST_F16 1
@@ -638,6 +651,8 @@ int coli_v4_resident_tier_plan(
     ColiDeepSeekV4ResidentTierPlan *plan,
     const ColiDeepSeekV4ResidentTierInputs *inputs,
     char *error, size_t error_size);
+uint64_t coli_v4_context_reserve_bytes(
+    const ColiDeepSeekV4Config *config, int context, int lazy);
 /* ==== end deepseek_v4_resource_plan.h ==== */
 
 /* ==== begin deepseek_v4_head_cache.h ==== */

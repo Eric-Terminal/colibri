@@ -406,6 +406,9 @@ def env_for_engine(a, arch):
         if a.ctx: env["CTX"] = str(a.ctx)
         if getattr(a, "low_memory", False):
             env["COLI_V4_LOW_MEMORY"] = "1"
+            # 可增长的压缩 KV 使用模型所在卷作为文件后备，避免脏页落到内置盘 Swap。
+            if getattr(a, "model", None):
+                env["COLI_V4_CONTEXT_DIR"] = os.path.abspath(a.model)
         # Speculation stays opt-in. Real multi-turn chat measured only 1/15
         # accepted prompt-lookup candidates; recurrent-state replay dominated
         # the visible decode. V4_DRAFT=5 remains available for repeated code.

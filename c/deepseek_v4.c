@@ -810,6 +810,29 @@ int coli_v4_resident_tier_plan(
     }
     return 0;
 }
+
+uint64_t coli_v4_context_reserve_bytes(
+    const ColiDeepSeekV4Config *config, int context, int lazy) {
+    if (!config || context < 1) return 0;
+    uint64_t total = (uint64_t)config->num_hidden_layers *
+        config->sliding_window * config->head_dim * sizeof(float);
+    for (int layer = 0; layer < config->num_hidden_layers; layer++) {
+        int ratio = config->compress_ratios[layer];
+        if (!ratio) continue;
+        uint64_t compressed = lazy ? 16 :
+            ((uint64_t)context + (uint64_t)ratio - 1) / (uint64_t)ratio;
+        total += compressed * config->head_dim * sizeof(float);
+        if (ratio == 4) {
+            uint64_t indexed = compressed;
+            if (lazy) {
+                indexed = ((uint64_t)config->max_position_embeddings + 3) / 4;
+                if (indexed > 128) indexed = 128;
+            }
+            total += indexed * config->index_head_dim * sizeof(float);
+        }
+    }
+    return total;
+}
 #endif /* COLI_V4_UNIT_RESOURCE_PLAN */
 
 #ifdef COLI_V4_UNIT_HEAD_CACHE
@@ -933,21 +956,6 @@ static uint64_t expert_record_bytes(const ColiSafetensorsIndex *index) {
     return total;
 }
 
-static uint64_t context_bytes(const ColiDeepSeekV4Config *config, int context) {
-    uint64_t total = (uint64_t)config->num_hidden_layers *
-        config->sliding_window * config->head_dim * sizeof(float);
-    for (int layer = 0; layer < config->num_hidden_layers; layer++) {
-        int ratio = config->compress_ratios[layer];
-        if (!ratio) continue;
-        uint64_t compressed = ((uint64_t)context + (uint64_t)ratio - 1) /
-                              (uint64_t)ratio;
-        total += compressed * config->head_dim * sizeof(float);
-        if (ratio == 4)
-            total += compressed * config->index_head_dim * sizeof(float);
-    }
-    return total;
-}
-
 static int build_runtime_plan(ColiV4Engine *engine,
                               const ColiDeepSeekV4ExpertStoreOptions *options,
                               ColiDeepSeekV4ResourcePlan *plan,
@@ -986,7 +994,9 @@ static int build_runtime_plan(ColiV4Engine *engine,
     uint64_t hidden = (uint64_t)64 * config.hc_mult * config.hidden_size *
                       sizeof(float) * 2;
     uint64_t scratch = 512 * MIB;
-    uint64_t runtime_other = context_bytes(&config, context) + hidden + scratch;
+    uint64_t context_reserve = coli_v4_context_reserve_bytes(
+        &config, context, runtime->low_memory);
+    uint64_t runtime_other = context_reserve + hidden + scratch;
     if (UINT64_MAX - runtime_other < runtime->dspark_reserve_bytes) {
         snprintf(error, error_size, "V4 DSpark reserve overflow");
         return -1;
@@ -1045,10 +1055,14 @@ int coli_v4_expert_store_open_planned(
     if (build_runtime_plan(engine, options, &plan, error, error_size)) return -1;
     if (runtime->low_memory)
         fprintf(stderr,
-                "v4_low_memory mode=global-single-slot-sync "
-                "os_available=%.2fGiB budget=%.2fGiB swap=avoided\n",
-                plan.os_available_bytes / (double)GIB,
-                plan.planner_available_bytes / (double)GIB);
+            "v4_low_memory mode=global-single-slot-sync "
+            "os_available=%.2fGiB budget=%.2fGiB swap=avoided "
+            "context=lazy max=%d initial=%.2fMiB\n",
+            plan.os_available_bytes / (double)GIB,
+            plan.planner_available_bytes / (double)GIB,
+            runtime->context_tokens,
+            coli_v4_context_reserve_bytes(
+                &engine->config, runtime->context_tokens, 1) / 1048576.0);
     uint64_t per_slot = plan.expert_cache_bytes /
                         (uint64_t)plan.slots_per_layer;
     uint64_t head_bytes = 0, dense_bytes = 0;
@@ -1127,7 +1141,115 @@ int coli_v4_expert_store_open_planned(
 #include <float.h>
 #include <limits.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+
+#ifndef _WIN32
+#include <sys/mman.h>
+#include <sys/types.h>
+#include <unistd.h>
+#endif
+
+static int v4_context_storage_error(char *error, size_t error_size,
+                                    const char *message) {
+    if (error && error_size) snprintf(error, error_size, "%s", message);
+    return -1;
+}
+
+enum { V4_CONTEXT_HEAP = -1, V4_CONTEXT_FILE_BACKED = -2 };
+
+int coli_v4_context_storage_create(void **data, size_t initial_bytes,
+                                   size_t maximum_bytes,
+                                   size_t *allocated_bytes, int *fd,
+                                   char *error, size_t error_size) {
+    if (!data || !initial_bytes || maximum_bytes < initial_bytes ||
+        !allocated_bytes || !fd)
+        return v4_context_storage_error(
+            error, error_size, "无效的 V4 上下文存储参数");
+    *data = NULL;
+    *allocated_bytes = 0;
+    *fd = V4_CONTEXT_HEAP;
+#ifndef _WIN32
+    const char *directory = getenv("COLI_V4_CONTEXT_DIR");
+    if ((!directory || !*directory) && coli_v4_low_memory_enabled())
+        directory = getenv("SNAP");
+    if (coli_v4_low_memory_enabled() && directory && *directory) {
+        char path[4096];
+        int length = snprintf(path, sizeof(path),
+                              "%s/.coli-v4-context-XXXXXX", directory);
+        if (length < 0 || (size_t)length >= sizeof(path))
+            return v4_context_storage_error(
+                error, error_size, "V4 上下文存储路径过长");
+        int backing = mkstemp(path);
+        if (backing < 0)
+            return v4_context_storage_error(
+                error, error_size, "无法在模型盘创建 V4 上下文存储");
+        unlink(path);
+        if (ftruncate(backing, (off_t)maximum_bytes)) {
+            close(backing);
+            return v4_context_storage_error(
+                error, error_size, "无法调整 V4 上下文存储大小");
+        }
+        void *mapped = mmap(NULL, maximum_bytes, PROT_READ | PROT_WRITE,
+                            MAP_SHARED, backing, 0);
+        if (mapped == MAP_FAILED) {
+            close(backing);
+            return v4_context_storage_error(
+                error, error_size, "无法映射 V4 上下文存储");
+        }
+        close(backing);
+        static int announced = 0;
+        if (!announced) {
+            fprintf(stderr,
+                    "v4_context_store mode=file-backed growth=lazy dir=%s\n",
+                    directory);
+            announced = 1;
+        }
+        *data = mapped;
+        *allocated_bytes = maximum_bytes;
+        *fd = V4_CONTEXT_FILE_BACKED;
+        return 0;
+    }
+#endif
+    *data = calloc(1, initial_bytes);
+    if (!*data)
+        return v4_context_storage_error(
+            error, error_size, "无法分配 V4 上下文存储");
+    *allocated_bytes = initial_bytes;
+    return 0;
+}
+
+int coli_v4_context_storage_resize(void **data, size_t old_bytes,
+                                   size_t new_bytes, int fd,
+                                   char *error, size_t error_size) {
+    if (!data || !*data || !old_bytes || new_bytes <= old_bytes)
+        return v4_context_storage_error(
+            error, error_size, "无效的 V4 上下文扩容参数");
+#ifndef _WIN32
+    if (fd == V4_CONTEXT_FILE_BACKED)
+        return new_bytes <= old_bytes ? 0 : v4_context_storage_error(
+            error, error_size, "V4 上下文超过稀疏映射上限");
+#endif
+    void *grown = realloc(*data, new_bytes);
+    if (!grown)
+        return v4_context_storage_error(
+            error, error_size, "无法扩展 V4 上下文存储");
+    memset((unsigned char *)grown + old_bytes, 0, new_bytes - old_bytes);
+    *data = grown;
+    return 0;
+}
+
+void coli_v4_context_storage_destroy(void *data, size_t bytes, int fd) {
+    if (!data) return;
+#ifndef _WIN32
+    if (fd == V4_CONTEXT_FILE_BACKED) {
+        munmap(data, bytes);
+        return;
+    }
+#endif
+    free(data);
+}
 
 typedef struct {
     float weight;
@@ -1598,6 +1720,8 @@ struct ColiDeepSeekV4WindowAttentionState {
     float *compressed;
     int compressed_count;
     int compressed_capacity;
+    size_t compressed_bytes;
+    int compressed_fd;
 };
 
 int coli_v4_window_attention_create(ColiDeepSeekV4WindowAttentionState **output,
@@ -1609,6 +1733,7 @@ int coli_v4_window_attention_create(ColiDeepSeekV4WindowAttentionState **output,
     (*output)->window_size = config->sliding_window;
     (*output)->head_dim = config->head_dim;
     (*output)->layer = -1;
+    (*output)->compressed_fd = -1;
     (*output)->kv = calloc((size_t)config->sliding_window * config->head_dim,
                            sizeof(*(*output)->kv));
     if (!(*output)->kv) {
@@ -1632,7 +1757,8 @@ void coli_v4_window_attention_destroy(ColiDeepSeekV4WindowAttentionState *state)
     if (!state) return;
     coli_v4_indexer_destroy(state->indexer);
     coli_v4_compressor_destroy(state->compressor);
-    free(state->compressed);
+    coli_v4_context_storage_destroy(
+        state->compressed, state->compressed_bytes, state->compressed_fd);
     free(state->kv);
     free(state);
 }
@@ -1647,9 +1773,19 @@ static int prepare_compressed_state(
         state->layer = weights->plan.layer;
         state->ratio = ratio;
         state->compressed_capacity = 16;
-        state->compressed = calloc((size_t)state->compressed_capacity * state->head_dim,
-                                   sizeof(*state->compressed));
-        if (!state->compressed || coli_v4_compressor_create(
+        size_t initial_bytes = (size_t)state->compressed_capacity *
+                               state->head_dim * sizeof(*state->compressed);
+        size_t maximum_capacity =
+            ((size_t)config->max_position_embeddings + ratio - 1) / ratio;
+        if (maximum_capacity < (size_t)state->compressed_capacity)
+            maximum_capacity = (size_t)state->compressed_capacity;
+        size_t maximum_bytes = maximum_capacity * state->head_dim *
+                               sizeof(*state->compressed);
+        if (coli_v4_context_storage_create(
+                (void **)&state->compressed, initial_bytes, maximum_bytes,
+                &state->compressed_bytes,
+                &state->compressed_fd, error, error_size) ||
+            coli_v4_compressor_create(
                 &state->compressor, weights, config, error, error_size)) return -1;
         if (ratio == 4 && coli_v4_indexer_create(
                 &state->indexer, weights, config, config->max_position_embeddings,
@@ -1668,10 +1804,14 @@ static int grow_compressed_state(ColiDeepSeekV4WindowAttentionState *state,
                                  char *error, size_t error_size) {
     if (state->compressed_count < state->compressed_capacity) return 0;
     int capacity = state->compressed_capacity * 2;
-    float *grown = realloc(state->compressed,
-        (size_t)capacity * state->head_dim * sizeof(*grown));
-    if (!grown) return set_error(error, error_size, "cannot grow compressed KV cache");
-    state->compressed = grown;
+    size_t bytes = (size_t)capacity * state->head_dim *
+                   sizeof(*state->compressed);
+    if (bytes > state->compressed_bytes) {
+        if (coli_v4_context_storage_resize(
+                (void **)&state->compressed, state->compressed_bytes, bytes,
+                state->compressed_fd, error, error_size)) return -1;
+        state->compressed_bytes = bytes;
+    }
     state->compressed_capacity = capacity;
     return 0;
 }
@@ -1852,11 +1992,11 @@ static int attention_token_impl(float *output,
                (size_t)head_dim * sizeof(*kv));
         if (!state->indexer) compressed_selected = state->compressed_count;
         int topk = state->window_size + compressed_selected;
-        int kv_count = state->window_size + state->compressed_count;
+        int kv_count = state->window_size + compressed_selected;
         int *indices = malloc((size_t)topk * sizeof(*indices));
-        float *all_kv = state->compressed_count
+        float *all_kv = compressed_selected
             ? malloc((size_t)kv_count * head_dim * sizeof(*all_kv)) : NULL;
-        if (!indices || (state->compressed_count && !all_kv)) result = -1;
+        if (!indices || (compressed_selected && !all_kv)) result = -1;
         if (!result) {
             if (position < state->window_size - 1) {
                 for (int i = 0; i < state->window_size; i++)
@@ -1867,18 +2007,24 @@ static int attention_token_impl(float *output,
                     indices[i] = (oldest + i) % state->window_size;
             }
             const float *kv_values = state->kv;
-            if (state->compressed_count) {
+            if (compressed_selected) {
                 memcpy(all_kv, state->kv,
                        (size_t)state->window_size * head_dim * sizeof(*all_kv));
-                memcpy(all_kv + (size_t)state->window_size * head_dim,
-                       state->compressed,
-                       (size_t)state->compressed_count * head_dim * sizeof(*all_kv));
+                if (state->indexer) {
+                    for (int i = 0; i < compressed_selected; i++)
+                        memcpy(all_kv + (size_t)(state->window_size + i) * head_dim,
+                               state->compressed +
+                                   (size_t)compressed_indices[i] * head_dim,
+                               (size_t)head_dim * sizeof(*all_kv));
+                } else {
+                    memcpy(all_kv + (size_t)state->window_size * head_dim,
+                           state->compressed,
+                           (size_t)compressed_selected * head_dim * sizeof(*all_kv));
+                }
                 kv_values = all_kv;
             }
-            for (int i = 0; i < compressed_selected; i++) {
-                int ordinal = state->indexer ? compressed_indices[i] : i;
-                indices[state->window_size + i] = state->window_size + ordinal;
-            }
+            for (int i = 0; i < compressed_selected; i++)
+                indices[state->window_size + i] = state->window_size + i;
             result = coli_v4_sparse_attention_ref(
                 attended, q, kv_values, sinks, indices, heads, head_dim,
                 kv_count, topk,
@@ -1987,6 +2133,8 @@ struct ColiDeepSeekV4WindowAttentionState {
     float *compressed;
     int compressed_count;
     int compressed_capacity;
+    size_t compressed_bytes;
+    int compressed_fd;
 };
 
 int coli_v4_window_attention_create(ColiDeepSeekV4WindowAttentionState **output,
@@ -1998,6 +2146,7 @@ int coli_v4_window_attention_create(ColiDeepSeekV4WindowAttentionState **output,
     (*output)->window_size = config->sliding_window;
     (*output)->head_dim = config->head_dim;
     (*output)->layer = -1;
+    (*output)->compressed_fd = -1;
     (*output)->kv = calloc((size_t)config->sliding_window * config->head_dim,
                            sizeof(*(*output)->kv));
     if (!(*output)->kv) {
@@ -2021,7 +2170,8 @@ void coli_v4_window_attention_destroy(ColiDeepSeekV4WindowAttentionState *state)
     if (!state) return;
     coli_v4_indexer_destroy(state->indexer);
     coli_v4_compressor_destroy(state->compressor);
-    free(state->compressed);
+    coli_v4_context_storage_destroy(
+        state->compressed, state->compressed_bytes, state->compressed_fd);
     free(state->kv);
     free(state);
 }
@@ -2036,9 +2186,19 @@ static int prepare_compressed_state(
         state->layer = weights->plan.layer;
         state->ratio = ratio;
         state->compressed_capacity = 16;
-        state->compressed = calloc((size_t)state->compressed_capacity * state->head_dim,
-                                   sizeof(*state->compressed));
-        if (!state->compressed || coli_v4_compressor_create(
+        size_t initial_bytes = (size_t)state->compressed_capacity *
+                               state->head_dim * sizeof(*state->compressed);
+        size_t maximum_capacity =
+            ((size_t)config->max_position_embeddings + ratio - 1) / ratio;
+        if (maximum_capacity < (size_t)state->compressed_capacity)
+            maximum_capacity = (size_t)state->compressed_capacity;
+        size_t maximum_bytes = maximum_capacity * state->head_dim *
+                               sizeof(*state->compressed);
+        if (coli_v4_context_storage_create(
+                (void **)&state->compressed, initial_bytes, maximum_bytes,
+                &state->compressed_bytes,
+                &state->compressed_fd, error, error_size) ||
+            coli_v4_compressor_create(
                 &state->compressor, weights, config, error, error_size)) return -1;
         if (ratio == 4 && coli_v4_indexer_create(
                 &state->indexer, weights, config, config->max_position_embeddings,
@@ -2057,10 +2217,14 @@ static int grow_compressed_state(ColiDeepSeekV4WindowAttentionState *state,
                                  char *error, size_t error_size) {
     if (state->compressed_count < state->compressed_capacity) return 0;
     int capacity = state->compressed_capacity * 2;
-    float *grown = realloc(state->compressed,
-        (size_t)capacity * state->head_dim * sizeof(*grown));
-    if (!grown) return set_error(error, error_size, "cannot grow compressed KV cache");
-    state->compressed = grown;
+    size_t bytes = (size_t)capacity * state->head_dim *
+                   sizeof(*state->compressed);
+    if (bytes > state->compressed_bytes) {
+        if (coli_v4_context_storage_resize(
+                (void **)&state->compressed, state->compressed_bytes, bytes,
+                state->compressed_fd, error, error_size)) return -1;
+        state->compressed_bytes = bytes;
+    }
     state->compressed_capacity = capacity;
     return 0;
 }
@@ -2241,11 +2405,11 @@ static int attention_token_impl(float *output,
                (size_t)head_dim * sizeof(*kv));
         if (!state->indexer) compressed_selected = state->compressed_count;
         int topk = state->window_size + compressed_selected;
-        int kv_count = state->window_size + state->compressed_count;
+        int kv_count = state->window_size + compressed_selected;
         int *indices = malloc((size_t)topk * sizeof(*indices));
-        float *all_kv = state->compressed_count
+        float *all_kv = compressed_selected
             ? malloc((size_t)kv_count * head_dim * sizeof(*all_kv)) : NULL;
-        if (!indices || (state->compressed_count && !all_kv)) result = -1;
+        if (!indices || (compressed_selected && !all_kv)) result = -1;
         if (!result) {
             if (position < state->window_size - 1) {
                 for (int i = 0; i < state->window_size; i++)
@@ -2256,18 +2420,24 @@ static int attention_token_impl(float *output,
                     indices[i] = (oldest + i) % state->window_size;
             }
             const float *kv_values = state->kv;
-            if (state->compressed_count) {
+            if (compressed_selected) {
                 memcpy(all_kv, state->kv,
                        (size_t)state->window_size * head_dim * sizeof(*all_kv));
-                memcpy(all_kv + (size_t)state->window_size * head_dim,
-                       state->compressed,
-                       (size_t)state->compressed_count * head_dim * sizeof(*all_kv));
+                if (state->indexer) {
+                    for (int i = 0; i < compressed_selected; i++)
+                        memcpy(all_kv + (size_t)(state->window_size + i) * head_dim,
+                               state->compressed +
+                                   (size_t)compressed_indices[i] * head_dim,
+                               (size_t)head_dim * sizeof(*all_kv));
+                } else {
+                    memcpy(all_kv + (size_t)state->window_size * head_dim,
+                           state->compressed,
+                           (size_t)compressed_selected * head_dim * sizeof(*all_kv));
+                }
                 kv_values = all_kv;
             }
-            for (int i = 0; i < compressed_selected; i++) {
-                int ordinal = state->indexer ? compressed_indices[i] : i;
-                indices[state->window_size + i] = state->window_size + ordinal;
-            }
+            for (int i = 0; i < compressed_selected; i++)
+                indices[state->window_size + i] = state->window_size + i;
             result = coli_v4_sparse_attention_ref(
                 attended, q, kv_values, sinks, indices, heads, head_dim,
                 kv_count, topk,
@@ -2396,10 +2566,12 @@ int coli_v4_attention_window_batch_ref(
         return set_error(error, error_size, "out of memory in batched attention");
     }
 
+    const char *failure_stage = "query projection";
     int result = coli_fp8_matmul_batch_ref(qa, &wq_a, inputs, batch);
     if (!result) coli_bf16_round_array(qa, (size_t)batch * q_rank);
     const void *raw_q_norm = layer_data(weights, "attn.q_norm.weight", NULL);
     if (!result && (!raw_q_norm || decode_bf16(norm, raw_q_norm, q_rank))) result = -1;
+    if (!result) failure_stage = "query normalization";
     for (int item = 0; !result && item < batch; item++) {
         float *item_qa = qa + (size_t)item * q_rank;
         result = coli_v4_rmsnorm(item_qa, item_qa, norm, q_rank,
@@ -2407,6 +2579,7 @@ int coli_v4_attention_window_batch_ref(
         if (!result) coli_bf16_round_array(item_qa, (size_t)q_rank);
     }
 
+    if (!result) failure_stage = "context update";
     for (int item = 0; !result && item < batch; item++) {
         int position = start_position + item;
         if (weights->plan.compression_ratio) {
@@ -2436,6 +2609,7 @@ int coli_v4_attention_window_batch_ref(
         }
     }
 
+    if (!result) failure_stage = "query expansion";
     if (!result) result = coli_fp8_matmul_batch_ref(q, &wq_b, qa, batch);
     if (!result) coli_bf16_round_array(q, (size_t)batch * q_width);
     for (int item = 0; !result && item < batch; item++)
@@ -2448,6 +2622,7 @@ int coli_v4_attention_window_batch_ref(
                 values[i] = coli_bf16_round(values[i] * scale);
         }
 
+    if (!result) failure_stage = "KV projection";
     if (!result) result = coli_fp8_matmul_batch_ref(kv, &wkv, inputs, batch);
     if (!result) coli_bf16_round_array(kv, (size_t)batch * head_dim);
     const void *raw_kv_norm = layer_data(weights, "attn.kv_norm.weight", NULL);
@@ -2459,6 +2634,7 @@ int coli_v4_attention_window_batch_ref(
         if (!result) coli_bf16_round_array(item_kv, (size_t)head_dim);
     }
 
+    if (!result) failure_stage = "RoPE";
     int compressed = weights->plan.compression_ratio != 0;
     if (!result) result = coli_v4_rope_precompute_range(
         cosines, sines, rope_dim, start_position, batch,
@@ -2490,6 +2666,7 @@ int coli_v4_attention_window_batch_ref(
         free(scales); free(qdq);
     }
 
+    if (!result) failure_stage = "sparse attention";
     const float *sinks = layer_data(weights, "attn.attn_sink", NULL);
     for (int item = 0; !result && item < batch; item++) {
         int position = start_position + item;
@@ -2502,11 +2679,11 @@ int coli_v4_attention_window_batch_ref(
         int selected = selected_counts[item];
         int compressed_count = compressed_counts[item];
         int topk = state->window_size + selected;
-        int kv_count = state->window_size + compressed_count;
+        int kv_count = state->window_size + selected;
         int *indices = malloc((size_t)topk * sizeof(*indices));
-        float *all_kv = compressed_count
+        float *all_kv = selected
             ? malloc((size_t)kv_count * head_dim * sizeof(*all_kv)) : NULL;
-        if (!indices || (compressed_count && !all_kv)) result = -1;
+        if (!indices || (selected && !all_kv)) result = -1;
         if (!result) {
             if (position < state->window_size - 1)
                 for (int i = 0; i < state->window_size; i++)
@@ -2517,19 +2694,26 @@ int coli_v4_attention_window_batch_ref(
                     indices[i] = (oldest + i) % state->window_size;
             }
             const float *values = state->kv;
-            if (compressed_count) {
+            if (selected) {
                 memcpy(all_kv, state->kv,
                        (size_t)state->window_size * head_dim * sizeof(*all_kv));
-                memcpy(all_kv + (size_t)state->window_size * head_dim,
-                       state->compressed,
-                       (size_t)compressed_count * head_dim * sizeof(*all_kv));
+                if (state->indexer) {
+                    for (int i = 0; i < selected; i++) {
+                        int ordinal = compressed_indices[
+                            (size_t)item * config->index_topk + i];
+                        memcpy(all_kv + (size_t)(state->window_size + i) * head_dim,
+                               state->compressed + (size_t)ordinal * head_dim,
+                               (size_t)head_dim * sizeof(*all_kv));
+                    }
+                } else {
+                    memcpy(all_kv + (size_t)state->window_size * head_dim,
+                           state->compressed,
+                           (size_t)compressed_count * head_dim * sizeof(*all_kv));
+                }
                 values = all_kv;
             }
-            for (int i = 0; i < selected; i++) {
-                int ordinal = state->indexer
-                    ? compressed_indices[(size_t)item * config->index_topk + i] : i;
-                indices[state->window_size + i] = state->window_size + ordinal;
-            }
+            for (int i = 0; i < selected; i++)
+                indices[state->window_size + i] = state->window_size + i;
             result = coli_v4_sparse_attention_ref(
                 item_attended, item_q, values, sinks, indices, heads, head_dim,
                 kv_count, topk, 1.0f / sqrtf((float)head_dim));
@@ -2545,6 +2729,7 @@ int coli_v4_attention_window_batch_ref(
         }
     }
 
+    if (!result) failure_stage = "output projection A";
     int heads_per_group = heads / groups;
     int group_width = heads_per_group * head_dim;
     int scale_columns = (group_width + 127) / 128;
@@ -2575,6 +2760,7 @@ int coli_v4_attention_window_batch_ref(
                    (size_t)o_rank * sizeof(*oa));
     }
     if (!result) coli_bf16_round_array(oa, (size_t)batch * oa_width);
+    if (!result) failure_stage = "output projection B";
     if (!result) result = coli_fp8_matmul_batch_ref(outputs, &wo_b, oa, batch);
     if (!result) coli_bf16_round_array(outputs, (size_t)batch * hidden);
 
@@ -2582,7 +2768,10 @@ int coli_v4_attention_window_batch_ref(
     free(sines); free(cosines);
     free(compressed_indices); free(compressed_counts); free(selected_counts);
     free(norm); free(oa); free(attended); free(kv); free(q); free(qa);
-    return result ? set_error(error, error_size, "batched attention failed") : 0;
+    if (!result) return 0;
+    if (error && error_size && *error) return -1;
+    return set_error(error, error_size, "batched attention failed during %s",
+                     failure_stage);
 }
 #endif /* COLI_V4_UNIT_ATTENTION_BATCH */
 
@@ -2862,6 +3051,8 @@ struct ColiDeepSeekV4Indexer {
     int capacity;
     int count;
     float *compressed;
+    size_t compressed_bytes;
+    int compressed_fd;
 };
 
 typedef struct { float score; int index; } IndexScore;
@@ -2923,17 +3114,26 @@ int coli_v4_indexer_create(ColiDeepSeekV4Indexer **output,
     *output = NULL;
     ColiDeepSeekV4Indexer *state = calloc(1, sizeof(*state));
     if (!state) return set_error(error, error_size, "out of memory creating indexer");
+    state->compressed_fd = -1;
     state->weights = weights;
     state->config = config;
     state->layer = weights->plan.layer;
     state->capacity = (max_context + 3) / 4;
     if (state->capacity > 128) state->capacity = 128;
-    state->compressed = calloc((size_t)state->capacity * config->index_head_dim,
-                               sizeof(*state->compressed));
+    size_t initial_bytes = (size_t)state->capacity *
+                           config->index_head_dim *
+                           sizeof(*state->compressed);
+    size_t maximum_capacity = ((size_t)max_context + 3) / 4;
+    size_t maximum_bytes = maximum_capacity * config->index_head_dim *
+                           sizeof(*state->compressed);
     ColiDeepSeekV4CompressorOptions options = {
         "attn.indexer.compressor", config->index_head_dim, 1
     };
-    if (!state->compressed || coli_v4_compressor_create_with_options(
+    if (coli_v4_context_storage_create(
+            (void **)&state->compressed, initial_bytes, maximum_bytes,
+            &state->compressed_bytes,
+            &state->compressed_fd, error, error_size) ||
+        coli_v4_compressor_create_with_options(
             &state->compressor, weights, config, &options, error, error_size)) {
         coli_v4_indexer_destroy(state);
         return set_error(error, error_size, "cannot create indexer compressor");
@@ -2964,7 +3164,8 @@ void coli_v4_indexer_reset(ColiDeepSeekV4Indexer *state) {
 void coli_v4_indexer_destroy(ColiDeepSeekV4Indexer *state) {
     if (!state) return;
     coli_v4_compressor_destroy(state->compressor);
-    free(state->compressed);
+    coli_v4_context_storage_destroy(
+        state->compressed, state->compressed_bytes, state->compressed_fd);
     free(state);
 }
 
@@ -3004,12 +3205,14 @@ int coli_v4_indexer_step(ColiDeepSeekV4Indexer *state, int *indices,
     int produced = 0;
     if ((position + 1) % 4 == 0 && state->count >= state->capacity) {
         int next_capacity = state->capacity * 2;
-        float *grown = realloc(state->compressed,
-            (size_t)next_capacity * dimension * sizeof(*grown));
-        if (!grown) return set_error(error, error_size, "cannot grow indexer cache");
-        memset(grown + (size_t)state->capacity * dimension, 0,
-               (size_t)(next_capacity - state->capacity) * dimension * sizeof(*grown));
-        state->compressed = grown;
+        size_t bytes = (size_t)next_capacity * dimension *
+                       sizeof(*state->compressed);
+        if (bytes > state->compressed_bytes) {
+            if (coli_v4_context_storage_resize(
+                    (void **)&state->compressed, state->compressed_bytes, bytes,
+                    state->compressed_fd, error, error_size)) return -1;
+            state->compressed_bytes = bytes;
+        }
         state->capacity = next_capacity;
     }
     float *next = state->count < state->capacity
@@ -4735,6 +4938,8 @@ struct ColiDeepSeekV4Indexer {
     int capacity;
     int count;
     float *compressed;
+    size_t compressed_bytes;
+    int compressed_fd;
 };
 
 typedef struct { float score; int index; } IndexScore;
@@ -4796,17 +5001,26 @@ int coli_v4_indexer_create(ColiDeepSeekV4Indexer **output,
     *output = NULL;
     ColiDeepSeekV4Indexer *state = calloc(1, sizeof(*state));
     if (!state) return set_error(error, error_size, "out of memory creating indexer");
+    state->compressed_fd = -1;
     state->weights = weights;
     state->config = config;
     state->layer = weights->plan.layer;
     state->capacity = (max_context + 3) / 4;
     if (state->capacity > 128) state->capacity = 128;
-    state->compressed = calloc((size_t)state->capacity * config->index_head_dim,
-                               sizeof(*state->compressed));
+    size_t initial_bytes = (size_t)state->capacity *
+                           config->index_head_dim *
+                           sizeof(*state->compressed);
+    size_t maximum_capacity = ((size_t)max_context + 3) / 4;
+    size_t maximum_bytes = maximum_capacity * config->index_head_dim *
+                           sizeof(*state->compressed);
     ColiDeepSeekV4CompressorOptions options = {
         "attn.indexer.compressor", config->index_head_dim, 1
     };
-    if (!state->compressed || coli_v4_compressor_create_with_options(
+    if (coli_v4_context_storage_create(
+            (void **)&state->compressed, initial_bytes, maximum_bytes,
+            &state->compressed_bytes,
+            &state->compressed_fd, error, error_size) ||
+        coli_v4_compressor_create_with_options(
             &state->compressor, weights, config, &options, error, error_size)) {
         coli_v4_indexer_destroy(state);
         return set_error(error, error_size, "cannot create indexer compressor");
@@ -4837,7 +5051,8 @@ void coli_v4_indexer_reset(ColiDeepSeekV4Indexer *state) {
 void coli_v4_indexer_destroy(ColiDeepSeekV4Indexer *state) {
     if (!state) return;
     coli_v4_compressor_destroy(state->compressor);
-    free(state->compressed);
+    coli_v4_context_storage_destroy(
+        state->compressed, state->compressed_bytes, state->compressed_fd);
     free(state);
 }
 
@@ -4877,12 +5092,14 @@ int coli_v4_indexer_step(ColiDeepSeekV4Indexer *state, int *indices,
     int produced = 0;
     if ((position + 1) % 4 == 0 && state->count >= state->capacity) {
         int next_capacity = state->capacity * 2;
-        float *grown = realloc(state->compressed,
-            (size_t)next_capacity * dimension * sizeof(*grown));
-        if (!grown) return set_error(error, error_size, "cannot grow indexer cache");
-        memset(grown + (size_t)state->capacity * dimension, 0,
-               (size_t)(next_capacity - state->capacity) * dimension * sizeof(*grown));
-        state->compressed = grown;
+        size_t bytes = (size_t)next_capacity * dimension *
+                       sizeof(*state->compressed);
+        if (bytes > state->compressed_bytes) {
+            if (coli_v4_context_storage_resize(
+                    (void **)&state->compressed, state->compressed_bytes, bytes,
+                    state->compressed_fd, error, error_size)) return -1;
+            state->compressed_bytes = bytes;
+        }
         state->capacity = next_capacity;
     }
     float *next = state->count < state->capacity
@@ -5058,6 +5275,8 @@ struct ColiDeepSeekV4WindowAttentionState {
     float *compressed;
     int compressed_count;
     int compressed_capacity;
+    size_t compressed_bytes;
+    int compressed_fd;
 };
 
 int coli_v4_window_attention_create(ColiDeepSeekV4WindowAttentionState **output,
@@ -5069,6 +5288,7 @@ int coli_v4_window_attention_create(ColiDeepSeekV4WindowAttentionState **output,
     (*output)->window_size = config->sliding_window;
     (*output)->head_dim = config->head_dim;
     (*output)->layer = -1;
+    (*output)->compressed_fd = -1;
     (*output)->kv = calloc((size_t)config->sliding_window * config->head_dim,
                            sizeof(*(*output)->kv));
     if (!(*output)->kv) {
@@ -5092,7 +5312,8 @@ void coli_v4_window_attention_destroy(ColiDeepSeekV4WindowAttentionState *state)
     if (!state) return;
     coli_v4_indexer_destroy(state->indexer);
     coli_v4_compressor_destroy(state->compressor);
-    free(state->compressed);
+    coli_v4_context_storage_destroy(
+        state->compressed, state->compressed_bytes, state->compressed_fd);
     free(state->kv);
     free(state);
 }
@@ -5107,9 +5328,19 @@ static int prepare_compressed_state(
         state->layer = weights->plan.layer;
         state->ratio = ratio;
         state->compressed_capacity = 16;
-        state->compressed = calloc((size_t)state->compressed_capacity * state->head_dim,
-                                   sizeof(*state->compressed));
-        if (!state->compressed || coli_v4_compressor_create(
+        size_t initial_bytes = (size_t)state->compressed_capacity *
+                               state->head_dim * sizeof(*state->compressed);
+        size_t maximum_capacity =
+            ((size_t)config->max_position_embeddings + ratio - 1) / ratio;
+        if (maximum_capacity < (size_t)state->compressed_capacity)
+            maximum_capacity = (size_t)state->compressed_capacity;
+        size_t maximum_bytes = maximum_capacity * state->head_dim *
+                               sizeof(*state->compressed);
+        if (coli_v4_context_storage_create(
+                (void **)&state->compressed, initial_bytes, maximum_bytes,
+                &state->compressed_bytes,
+                &state->compressed_fd, error, error_size) ||
+            coli_v4_compressor_create(
                 &state->compressor, weights, config, error, error_size)) return -1;
         if (ratio == 4 && coli_v4_indexer_create(
                 &state->indexer, weights, config, config->max_position_embeddings,
@@ -5128,10 +5359,14 @@ static int grow_compressed_state(ColiDeepSeekV4WindowAttentionState *state,
                                  char *error, size_t error_size) {
     if (state->compressed_count < state->compressed_capacity) return 0;
     int capacity = state->compressed_capacity * 2;
-    float *grown = realloc(state->compressed,
-        (size_t)capacity * state->head_dim * sizeof(*grown));
-    if (!grown) return set_error(error, error_size, "cannot grow compressed KV cache");
-    state->compressed = grown;
+    size_t bytes = (size_t)capacity * state->head_dim *
+                   sizeof(*state->compressed);
+    if (bytes > state->compressed_bytes) {
+        if (coli_v4_context_storage_resize(
+                (void **)&state->compressed, state->compressed_bytes, bytes,
+                state->compressed_fd, error, error_size)) return -1;
+        state->compressed_bytes = bytes;
+    }
     state->compressed_capacity = capacity;
     return 0;
 }
@@ -5312,11 +5547,11 @@ static int attention_token_impl(float *output,
                (size_t)head_dim * sizeof(*kv));
         if (!state->indexer) compressed_selected = state->compressed_count;
         int topk = state->window_size + compressed_selected;
-        int kv_count = state->window_size + state->compressed_count;
+        int kv_count = state->window_size + compressed_selected;
         int *indices = malloc((size_t)topk * sizeof(*indices));
-        float *all_kv = state->compressed_count
+        float *all_kv = compressed_selected
             ? malloc((size_t)kv_count * head_dim * sizeof(*all_kv)) : NULL;
-        if (!indices || (state->compressed_count && !all_kv)) result = -1;
+        if (!indices || (compressed_selected && !all_kv)) result = -1;
         if (!result) {
             if (position < state->window_size - 1) {
                 for (int i = 0; i < state->window_size; i++)
@@ -5327,18 +5562,24 @@ static int attention_token_impl(float *output,
                     indices[i] = (oldest + i) % state->window_size;
             }
             const float *kv_values = state->kv;
-            if (state->compressed_count) {
+            if (compressed_selected) {
                 memcpy(all_kv, state->kv,
                        (size_t)state->window_size * head_dim * sizeof(*all_kv));
-                memcpy(all_kv + (size_t)state->window_size * head_dim,
-                       state->compressed,
-                       (size_t)state->compressed_count * head_dim * sizeof(*all_kv));
+                if (state->indexer) {
+                    for (int i = 0; i < compressed_selected; i++)
+                        memcpy(all_kv + (size_t)(state->window_size + i) * head_dim,
+                               state->compressed +
+                                   (size_t)compressed_indices[i] * head_dim,
+                               (size_t)head_dim * sizeof(*all_kv));
+                } else {
+                    memcpy(all_kv + (size_t)state->window_size * head_dim,
+                           state->compressed,
+                           (size_t)compressed_selected * head_dim * sizeof(*all_kv));
+                }
                 kv_values = all_kv;
             }
-            for (int i = 0; i < compressed_selected; i++) {
-                int ordinal = state->indexer ? compressed_indices[i] : i;
-                indices[state->window_size + i] = state->window_size + ordinal;
-            }
+            for (int i = 0; i < compressed_selected; i++)
+                indices[state->window_size + i] = state->window_size + i;
             result = coli_v4_sparse_attention_ref(
                 attended, q, kv_values, sinks, indices, heads, head_dim,
                 kv_count, topk,
@@ -8700,9 +8941,12 @@ int coli_v4_session_generate(ColiV4Session *session,
 
     while (!done && generated_count < max_new) {
         int remaining = max_new - generated_count;
-        /* 当前投机验证比较的是 target argmax；采样时启用会改变目标分布。 */
-        if (!sampling && !options->no_dspark && !session->spec_disabled &&
-            remaining >= 3) {
+        /*
+         * 采样不能使用 argmax 投机验证；磁盘上下文也不能为一次投机复制
+         * 完整历史，否则长对话会重新制造同等大小的匿名内存峰值。
+         */
+        if (!sampling && !coli_v4_low_memory_enabled() &&
+            !options->no_dspark && !session->spec_disabled && remaining >= 3) {
             int inputs[25] = {0}, drafts[24] = {0};
             int predictions[25] = {0};
             float logits[25] = {0};
