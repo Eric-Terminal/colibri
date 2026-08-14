@@ -6844,8 +6844,8 @@ int COLI_V4_ROWS16_STORE_OPEN(
  *   EMAP  rows cols hex        (per expert: 2 hex digits, tier<<6 | heat)
  *   HITS  rows cols hex        (per-turn routed-expert bitmap, then cleared)
  *
- * The serve unit (COLI_V4_UNIT_GENERATE_STATS) calls these at turn
- * boundaries; the per-expert state lives here, so the store emits them.
+ * The serve unit (COLI_V4_UNIT_GENERATE_STATS) calls these while generating;
+ * the per-expert state lives here, so the store emits them.
  * V4 is CPU-only, so the VRAM tier is always 0 and "ram" means "resident in
  * the expert-store cache slots". Heat is the cumulative routing-selection
  * count (capped at 63, matching the GLM map's low-6-bit field).
@@ -6857,7 +6857,7 @@ void coli_v4_expert_store_emit_tiers(ColiExpertStore *store) {
     state = store->state;
     int resident = 0;
     pthread_mutex_lock(&state->mutex);
-    for (int i = 0; i < state->layers * state->slots_per_layer; i++)
+    for (size_t i = 0; i < expert_slot_count(state); i++)
         if (state->slots[i].slab && state->slots[i].expert >= 0) resident++;
     pthread_mutex_unlock(&state->mutex);
     int total = state->layers * state->experts_per_layer;
@@ -6876,25 +6876,37 @@ void coli_v4_expert_store_emit_emap(ColiExpertStore *store) {
     int rows = state->layers, cols = state->experts_per_layer;
     size_t cells = (size_t)rows * cols;
     char *hex = malloc(cells * 2 + 1);
-    if (!hex) return;
+    uint8_t *values = malloc(cells);
+    if (!hex || !values) {
+        free(values);
+        free(hex);
+        return;
+    }
     pthread_mutex_lock(&state->mutex);
     for (size_t i = 0; i < cells; i++) {
-        int tier = 0;
-        int layer = (int)(i / (size_t)cols), expert = (int)(i % (size_t)cols);
-        V4ExpertSlot *slots = state->slots +
-            (size_t)layer * state->slots_per_layer;
-        for (int z = 0; z < state->slots_per_layer; z++)
-            if (slots[z].slab && slots[z].expert == expert) { tier = 1; break; }
         int heat = state->eheat ? state->eheat[i] : 0;
         if (heat > 63) heat = 63;
-        int b = (tier << 6) | heat;
-        hex[i * 2] = "0123456789abcdef"[b >> 4];
-        hex[i * 2 + 1] = "0123456789abcdef"[b & 15];
+        values[i] = (uint8_t)heat;
+    }
+    /* 全局低内存缓存没有逐层槽数组；使用槽中记录的真实层号映射，
+     * 避免按 layer*slots_per_layer 越界读取并画出幽灵驻留专家。 */
+    for (size_t i = 0; i < expert_slot_count(state); i++) {
+        V4ExpertSlot *slot = &state->slots[i];
+        if (slot->slab && slot->layer >= 0 && slot->layer < rows &&
+            slot->expert >= 0 && slot->expert < cols) {
+            size_t cell = (size_t)slot->layer * cols + slot->expert;
+            values[cell] |= UINT8_C(1) << 6;
+        }
     }
     pthread_mutex_unlock(&state->mutex);
+    for (size_t i = 0; i < cells; i++) {
+        hex[i * 2] = "0123456789abcdef"[values[i] >> 4];
+        hex[i * 2 + 1] = "0123456789abcdef"[values[i] & 15];
+    }
     hex[cells * 2] = 0;
     printf("EMAP %d %d %s\n", rows, cols, hex);
     fflush(stdout);
+    free(values);
     free(hex);
 }
 
@@ -9386,6 +9398,7 @@ typedef struct {
 
 typedef struct {
     ColiV4Session *session;
+    ColiExpertStore *experts;
     const char *request_id;
     int cancelled;
 } V4ServeStream;
@@ -9402,7 +9415,7 @@ static double v4_serve_rss_gb(void) {
 
 /* Dashboard telemetry: the per-expert state lives in the expert-store unit
  * (COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16), so the emitters are exported from
- * there and called at turn boundaries from this unit. */
+ * there and called from this unit. */
 extern void coli_v4_expert_store_emit_tiers(ColiExpertStore *store);
 extern void coli_v4_expert_store_emit_emap(ColiExpertStore *store);
 extern void coli_v4_expert_store_emit_hits(ColiExpertStore *store);
@@ -9520,6 +9533,11 @@ static int v4_serve_token(void *user_data, int token, float logit,
     (void)position;
     (void)ordinal;
     V4ServeStream *stream = user_data;
+    /* 先发布本 token 已完成的专家路由，再发送文本。网关消费 DATA 时，
+     * 大脑页面便能读到同一 token 的命中快照，无需等待整轮结束。 */
+    coli_v4_expert_store_emit_hits(stream->experts);
+    coli_v4_expert_store_emit_emap(stream->experts);
+    coli_v4_expert_store_emit_tiers(stream->experts);
     if (token != 1) {
         char piece[1024];
         int bytes = tok_decode(&stream->session->tokenizer, &token, 1,
@@ -9605,7 +9623,7 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
         engine->experts ? coli_v4_expert_store_disk_sec(engine->experts) : 0.0;
     double matmul_before =
         engine->experts ? coli_v4_expert_store_matmul_sec(engine->experts) : 0.0;
-    V4ServeStream stream = {session, request->id, 0};
+    V4ServeStream stream = {session, engine->experts, request->id, 0};
     ColiV4SessionGenerateStats stats = {0};
     char error[512] = {0};
     double started = spec_now();
@@ -9652,7 +9670,6 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
         : 0.0;
     v4_prof_emit(elapsed, stats.prompt_tokens, completion,
                  expert_disk_s, expert_matmul_s);
-    coli_v4_expert_store_emit_hits(engine->experts);
     coli_v4_expert_store_emit_emap(engine->experts);
     coli_v4_expert_store_emit_tiers(engine->experts);
 }

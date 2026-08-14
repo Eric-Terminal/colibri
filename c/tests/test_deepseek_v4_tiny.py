@@ -195,16 +195,24 @@ def check_serve(binary: Path, model: Path, case: dict[str, object]) -> None:
         kv_slots=1,
     )
     sampled = ""
+    live_telemetry = False
     try:
         expected = token_prompt(case["greedy_new_ids"])
         for ordinal in range(2):
             pieces: list[str] = []
+
+            def collect(piece: str) -> None:
+                nonlocal live_telemetry
+                pieces.append(piece)
+                if engine.hits_seq and engine.emap and engine.tiers:
+                    live_telemetry = True
+
             stats = engine.generate(
                 token_prompt(case["prompt_ids"]),
                 int(case["max_new_tokens"]),
                 0.0,
                 1.0,
-                pieces.append,
+                collect,
             )
             actual = "".join(pieces)
             if actual != expected:
@@ -213,6 +221,18 @@ def check_serve(binary: Path, model: Path, case: dict[str, object]) -> None:
                 )
             if stats["prompt_tokens"] != len(case["prompt_ids"]):
                 raise AssertionError(f"serve round {ordinal}: bad prompt stats {stats}")
+            if ordinal == 0:
+                if not live_telemetry:
+                    raise AssertionError("serve round 0: telemetry did not arrive before token data")
+                cells = bytes.fromhex(engine.emap["map"])
+                resident = sum((cell >> 6) == 1 for cell in cells)
+                if engine.tiers["ram"] != 1 or resident != 1:
+                    raise AssertionError(
+                        "low-memory global slot leaked into dashboard map: "
+                        f"tiers={engine.tiers!r}, resident_cells={resident}"
+                    )
+                if not engine.hits or not any(bytes.fromhex(engine.hits)):
+                    raise AssertionError("serve round 0: live expert hit map is empty")
         pieces = []
         engine.generate(
             token_prompt(case["prompt_ids"]), 1, 1.0, 1.0, pieces.append,
