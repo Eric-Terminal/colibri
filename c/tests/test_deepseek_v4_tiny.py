@@ -204,7 +204,8 @@ def check_serve(binary: Path, model: Path, case: dict[str, object]) -> None:
             def collect(piece: str) -> None:
                 nonlocal live_telemetry
                 pieces.append(piece)
-                if engine.hits_seq and engine.emap and engine.tiers:
+                if (engine.hits_seq and engine.emap and engine.tiers and
+                        engine.expert_events):
                     live_telemetry = True
 
             stats = engine.generate(
@@ -231,8 +232,16 @@ def check_serve(binary: Path, model: Path, case: dict[str, object]) -> None:
                         "low-memory global slot leaked into dashboard map: "
                         f"tiers={engine.tiers!r}, resident_cells={resident}"
                     )
-                if not engine.hits or not any(bytes.fromhex(engine.hits)):
-                    raise AssertionError("serve round 0: live expert hit map is empty")
+                events = list(engine.expert_events)
+                rows = engine.emap["rows"]
+                event_rows = [event["row"] for event in events]
+                sweep = list(range(rows))
+                if not any(event_rows[start:start + rows] == sweep
+                           for start in range(len(event_rows) - rows + 1)):
+                    raise AssertionError(
+                        f"serve round 0: no ordered layer sweep in {event_rows}")
+                if not any(any(bytes.fromhex(event["hits"])) for event in events):
+                    raise AssertionError("serve round 0: live layer hit maps are empty")
         pieces = []
         engine.generate(
             token_prompt(case["prompt_ids"]), 1, 1.0, 1.0, pieces.append,

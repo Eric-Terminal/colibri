@@ -6843,6 +6843,8 @@ int COLI_V4_ROWS16_STORE_OPEN(
  *   TIERS vram ram disk vram_gb ram_gb
  *   EMAP  rows cols hex        (per expert: 2 hex digits, tier<<6 | heat)
  *   HITS  rows cols hex        (per-turn routed-expert bitmap, then cleared)
+ *   LAYER layer cols heat hits resident
+ *                              (逐层热度、命中行与全局驻留位图)
  *
  * The serve unit (COLI_V4_UNIT_GENERATE_STATS) calls these while generating;
  * the per-expert state lives here, so the store emits them.
@@ -6940,6 +6942,71 @@ void coli_v4_expert_store_emit_hits(ColiExpertStore *store) {
     fflush(stdout);
     free(bitmap);
     free(hex);
+}
+
+void coli_v4_expert_store_emit_layer(ColiExpertStore *store, int layer) {
+    V4ExpertStoreState *state;
+    if (!store || !store->state) return;
+    state = store->state;
+    int rows = state->layers, cols = state->experts_per_layer;
+    if (layer < 0 || layer >= rows || cols < 1) return;
+    size_t cells = (size_t)rows * cols;
+    size_t row_bytes = ((size_t)cols + 7) / 8;
+    size_t resident_bytes = (cells + 7) / 8;
+    uint8_t *heat = malloc((size_t)cols);
+    uint8_t *hits = calloc(row_bytes, 1);
+    uint8_t *resident = calloc(resident_bytes, 1);
+    char *heat_hex = malloc((size_t)cols * 2 + 1);
+    char *hits_hex = malloc(row_bytes * 2 + 1);
+    char *resident_hex = malloc(resident_bytes * 2 + 1);
+    if (!heat || !hits || !resident || !heat_hex || !hits_hex ||
+        !resident_hex) {
+        free(heat); free(hits); free(resident);
+        free(heat_hex); free(hits_hex); free(resident_hex);
+        return;
+    }
+
+    size_t base = (size_t)layer * cols;
+    pthread_mutex_lock(&state->mutex);
+    for (int expert = 0; expert < cols; expert++) {
+        size_t cell = base + (size_t)expert;
+        int value = state->eheat ? state->eheat[cell] : 0;
+        heat[expert] = (uint8_t)(value > 63 ? 63 : value);
+        if (state->ehit && state->ehit[cell])
+            hits[(size_t)expert >> 3] |=
+                (uint8_t)(1u << ((unsigned)expert & 7));
+    }
+    if (state->ehit) memset(state->ehit + base, 0, (size_t)cols);
+    for (size_t slot_id = 0; slot_id < expert_slot_count(state); slot_id++) {
+        V4ExpertSlot *slot = &state->slots[slot_id];
+        if (!slot->slab || slot->layer < 0 || slot->layer >= rows ||
+            slot->expert < 0 || slot->expert >= cols) continue;
+        size_t cell = (size_t)slot->layer * cols + slot->expert;
+        resident[cell >> 3] |= (uint8_t)(1u << (cell & 7));
+    }
+    pthread_mutex_unlock(&state->mutex);
+
+    static const char digits[] = "0123456789abcdef";
+    for (int expert = 0; expert < cols; expert++) {
+        heat_hex[(size_t)expert * 2] = digits[heat[expert] >> 4];
+        heat_hex[(size_t)expert * 2 + 1] = digits[heat[expert] & 15];
+    }
+    for (size_t byte = 0; byte < row_bytes; byte++) {
+        hits_hex[byte * 2] = digits[hits[byte] >> 4];
+        hits_hex[byte * 2 + 1] = digits[hits[byte] & 15];
+    }
+    for (size_t byte = 0; byte < resident_bytes; byte++) {
+        resident_hex[byte * 2] = digits[resident[byte] >> 4];
+        resident_hex[byte * 2 + 1] = digits[resident[byte] & 15];
+    }
+    heat_hex[(size_t)cols * 2] = 0;
+    hits_hex[row_bytes * 2] = 0;
+    resident_hex[resident_bytes * 2] = 0;
+    printf("LAYER %d %d %s %s %s\n", layer, cols, heat_hex, hits_hex,
+           resident_hex);
+    fflush(stdout);
+    free(heat); free(hits); free(resident);
+    free(heat_hex); free(hits_hex); free(resident_hex);
 }
 
 double coli_v4_expert_store_disk_sec(ColiExpertStore *store) {
@@ -8220,7 +8287,9 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
                         const ColiSafetensorsIndex *index,
                         const ColiDeepSeekV4Config *config,
                         ColiExpertStore *experts, const int *tokens,
-                        int start, int batch, char *error, size_t error_size) {
+                        int start, int batch, ColiV4SessionLayerFn on_layer,
+                        void *layer_user_data, char *error,
+                        size_t error_size) {
     if (!state_ptr || !next_ptr || !*state_ptr || !*next_ptr || !attention ||
         !index || !config || !experts || !tokens || start < 0 || batch < 1) {
         if (error && error_size)
@@ -8265,6 +8334,8 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
         for (int item = 0; item < batch; item++)
             v4_mainh_tap(config, layer_id, state + (size_t)item * hd,
                          (int64_t)start + item);
+        if (on_layer)
+            on_layer(layer_user_data, layer_id, start, batch);
     }
     *state_ptr = state;
     *next_ptr = next;
@@ -8276,6 +8347,7 @@ static int target_token(ColiV4Engine *engine, float **state_ptr, float **next_pt
                         const ColiSafetensorsIndex *index,
                         const ColiDeepSeekV4Config *config,
                         ColiExpertStore *experts, int token, int position,
+                        ColiV4SessionLayerFn on_layer, void *layer_user_data,
                         char *error, size_t error_size) {
     float *state = *state_ptr, *next = *next_ptr;
     if (load_embedding(state, index, config, token)) return -1;
@@ -8290,6 +8362,8 @@ static int target_token(ColiV4Engine *engine, float **state_ptr, float **next_pt
         if (result) return -1;
         float *swap = state; state = next; next = swap;
         v4_mainh_tap(config, layer_id, state, position);
+        if (on_layer)
+            on_layer(layer_user_data, layer_id, position, 1);
     }
     *state_ptr = state;
     *next_ptr = next;
@@ -8913,7 +8987,8 @@ int coli_v4_session_generate(ColiV4Session *session,
         if (target_batch(
                 engine, &state, &next, attention, index, config, experts,
                 session->prompt_ids + reuse + offset, reuse + offset,
-                final_chunk, error, error_size)) {
+                final_chunk, options->on_layer, options->layer_user_data,
+                error, error_size)) {
             kv_prefix_taint(&session->fed);
             return -1;
         }
@@ -9035,7 +9110,9 @@ int coli_v4_session_generate(ColiV4Session *session,
                         }
                     if (target_batch(engine, &state, &next, attention, index,
                                      config, experts, inputs, old_last + 1,
-                                     batch, error, error_size)) {
+                                     batch, options->on_layer,
+                                     options->layer_user_data, error,
+                                     error_size)) {
                         (void)spec_attention_restore(
                             attention, snapshots, config->num_hidden_layers);
                         spec_attention_free(snapshots,
@@ -9139,7 +9216,9 @@ int coli_v4_session_generate(ColiV4Session *session,
                         if (retained > 0 && target_batch(
                                 engine, &state, &next, attention, index,
                                 config, experts, inputs, old_last + 1,
-                                retained, error, error_size)) {
+                                retained, options->on_layer,
+                                options->layer_user_data, error,
+                                error_size)) {
                             spec_attention_free(
                                 snapshots, config->num_hidden_layers);
                             kv_prefix_taint(&session->fed);
@@ -9165,7 +9244,8 @@ int coli_v4_session_generate(ColiV4Session *session,
         }
         int position = last_processed + 1;
         if (target_token(engine, &state, &next, attention, index, config, experts,
-                         current, position, error, error_size)) {
+                         current, position, options->on_layer,
+                         options->layer_user_data, error, error_size)) {
             kv_prefix_taint(&session->fed);
             return -1;
         }
@@ -9253,7 +9333,7 @@ static int v4_oracle_teacher_forcing(
             return -1;
         }
     if (target_batch(NULL, &state, &next, attention, index, config, experts,
-                     full_ids, 0, full_count, error, error_size)) {
+                     full_ids, 0, full_count, NULL, NULL, error, error_size)) {
         free(state); free(next); free(hidden);
         return -1;
     }
@@ -9299,7 +9379,8 @@ static int v4_oracle_greedy_from_prompt(
             return -1;
         }
     if (target_batch(NULL, &state, &next, attention, index, config, experts,
-                     prompt_ids, 0, prompt_count, error, error_size)) {
+                     prompt_ids, 0, prompt_count, NULL, NULL,
+                     error, error_size)) {
         free(state); free(next); free(hidden);
         return -1;
     }
@@ -9316,7 +9397,7 @@ static int v4_oracle_greedy_from_prompt(
     int position = prompt_count;
     while (count < max_new && current != 1) {
         if (target_token(NULL, &state, &next, attention, index, config, experts,
-                         current, position, error, error_size) ||
+                         current, position, NULL, NULL, error, error_size) ||
             final_hidden(hidden, state, index, config, error, error_size) ||
             head_argmax(NULL, hidden, index, config, &current, &logit)) {
             free(state); free(next); free(hidden);
@@ -9419,6 +9500,7 @@ static double v4_serve_rss_gb(void) {
 extern void coli_v4_expert_store_emit_tiers(ColiExpertStore *store);
 extern void coli_v4_expert_store_emit_emap(ColiExpertStore *store);
 extern void coli_v4_expert_store_emit_hits(ColiExpertStore *store);
+extern void coli_v4_expert_store_emit_layer(ColiExpertStore *store, int layer);
 extern double coli_v4_expert_store_disk_sec(ColiExpertStore *store);
 extern double coli_v4_expert_store_matmul_sec(ColiExpertStore *store);   /* #890 */
 
@@ -9527,15 +9609,20 @@ static void v4_serve_data(const char *id, const char *data, int bytes) {
     fflush(stdout);
 }
 
+static void v4_serve_layer(void *user_data, int layer, int position, int width) {
+    (void)position;
+    (void)width;
+    V4ServeStream *stream = user_data;
+    coli_v4_expert_store_emit_layer(stream->experts, layer);
+}
+
 static int v4_serve_token(void *user_data, int token, float logit,
                           int position, int ordinal) {
     (void)logit;
     (void)position;
     (void)ordinal;
     V4ServeStream *stream = user_data;
-    /* 先发布本 token 已完成的专家路由，再发送文本。网关消费 DATA 时，
-     * 大脑页面便能读到同一 token 的命中快照，无需等待整轮结束。 */
-    coli_v4_expert_store_emit_hits(stream->experts);
+    /* 逐层回调已经消费本 token 的命中行；这里发布完整快照作为校准点。 */
     coli_v4_expert_store_emit_emap(stream->experts);
     coli_v4_expert_store_emit_tiers(stream->experts);
     if (token != 1) {
@@ -9635,6 +9722,8 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
             .no_dspark = 0,
             .temperature = request->temperature,
             .top_p = request->top_p,
+            .on_layer = v4_serve_layer,
+            .layer_user_data = &stream,
         },
         v4_serve_token, &stream, &stats, error, sizeof(error));
     double elapsed = spec_now() - started;
@@ -10031,7 +10120,8 @@ int main(int argc, char **argv) {
             if (load_embedding(tf_state + (size_t)item * hd_tf, index, &config,
                                full_ids[item])) goto cleanup;
         if (target_batch(engine, &tf_state, &tf_next, attention, index, &config,
-                         experts, full_ids, 0, full_count, error, sizeof(error))) {
+                         experts, full_ids, 0, full_count, NULL, NULL,
+                         error, sizeof(error))) {
             fprintf(stderr, "%s\n", error); goto cleanup;
         }
         for (int pos = 0; pos < full_count; pos++) {

@@ -119,12 +119,18 @@ typedef struct {
     int max_new_tokens_cap;  /* 0 => 512 */
 } ColiV4SessionCreateOptions;
 
+/* 每完成一个真实 Transformer 层便调用一次，用于流式呈现层级状态。 */
+typedef void (*ColiV4SessionLayerFn)(void *user_data, int layer,
+                                    int position, int width);
+
 typedef struct {
     int max_new_tokens;      /* required; clamped by session cap */
     int stop_at_sentence;
     int no_dspark;           /* disable speculative draft/verification */
     float temperature;       /* 0 表示贪心解码 */
     float top_p;             /* 0 等同于 1.0，不截断候选 */
+    ColiV4SessionLayerFn on_layer;
+    void *layer_user_data;
 } ColiV4SessionGenerateOptions;
 
 typedef struct {

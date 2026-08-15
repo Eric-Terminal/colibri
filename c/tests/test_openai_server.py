@@ -457,6 +457,37 @@ class FakeProcess:
 
 
 class DispatcherTest(unittest.TestCase):
+    def test_merges_layer_telemetry_before_token_data(self):
+        saw_event_before_data = []
+
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"EMAP 2 4 0102030445464748\n")
+            process.stdout.feed(b"LAYER 1 4 090a0b0c 05 84\n")
+            process.stdout.feed(b"DATA " + request_id + b" 1\nx\n")
+            process.stdout.feed(b"DONE " + request_id + b" STAT 1 2.5 0 1.0 4 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+
+        chunks = []
+
+        def collect(piece):
+            chunks.append(piece)
+            saw_event_before_data.append(bool(engine.expert_events))
+
+        engine.generate("hello", 4, 0.7, 0.9, collect)
+        engine.close()
+
+        self.assertEqual(chunks, ["x"])
+        self.assertEqual(saw_event_before_data, [True])
+        self.assertEqual(engine.emap["map"], "01024304090a0b4c")
+        self.assertEqual(list(engine.expert_events), [{
+            "seq": 1, "row": 1, "map": "090a0b0c", "hits": "05",
+            "resident": "84",
+        }])
+
     def test_dispatches_interleaved_requests_by_id(self):
         submitted = []
 
@@ -812,6 +843,29 @@ class HTTPTest(unittest.TestCase):
         self.assertEqual(scheduler["max_queue"], 8)
         self.assertIn("queued", scheduler)
         self.assertEqual(health["kv_slots"], 2)
+
+    def test_experts_returns_only_events_after_the_requested_sequence(self):
+        self.engine.telemetry_lock = threading.Lock()
+        self.engine.emap = {"rows": 2, "cols": 2, "map": "01020304"}
+        self.engine.hits = "02"
+        self.engine.hits_seq = 7
+        self.engine.expert_events = [
+            {"seq": 6, "row": 0, "map": "0102", "hits": "01", "resident": "00"},
+            {"seq": 7, "row": 1, "map": "0304", "hits": "02", "resident": "08"},
+        ]
+        try:
+            with self.request("/experts?after=6") as response:
+                payload = json.load(response)
+            self.assertEqual(payload["seq"], 7)
+            self.assertEqual([event["seq"] for event in payload["events"]], [7])
+            for after in ("bad", "-1"):
+                with self.subTest(after=after), self.assertRaises(HTTPError) as caught:
+                    self.request(f"/experts?after={after}")
+                self.assertEqual(caught.exception.code, 400)
+                caught.exception.close()
+        finally:
+            del (self.engine.telemetry_lock, self.engine.emap, self.engine.hits,
+                 self.engine.hits_seq, self.engine.expert_events)
 
     def test_profile_requires_auth(self):
         """/profile is served before require_auth(), so it needs its own gate.

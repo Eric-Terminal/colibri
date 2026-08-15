@@ -23,7 +23,7 @@ import uuid
 import v4_dsml                      # vendored DeepSeek V4 DSML reference primitives
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 
 HERE = Path(__file__).resolve().parent
@@ -43,6 +43,7 @@ END = b"\x01\x01END\x01\x01\n"
 READY = b"\x01\x01READY\x01\x01\n"
 MAX_BODY = 4 << 20
 PROFILE_TURNS = 120           # rolling window of per-turn PROF snapshots kept for /profile
+EXPERT_EVENTS = 256           # 足够覆盖数个 43 层扫描，同时限制遥测内存
 DEFAULT_CORS_ORIGINS = (
     "http://127.0.0.1:8000",
     "http://localhost:8000",
@@ -1707,11 +1708,13 @@ class Engine:
         self.closed = False
         self.dispatcher_error = None
         self.kv_slots = kv_slots
+        self.telemetry_lock = threading.Lock()
         self.tiers = None
         self.hwinfo = None
         self.emap = None
         self.hits = None
-        self.hits_seq = 0                      # latest "TIERS" snapshot from the engine
+        self.hits_seq = 0
+        self.expert_events = collections.deque(maxlen=EXPERT_EVENTS)
         self.profile = collections.deque(maxlen=PROFILE_TURNS)  # per-turn phase timings
         self.profile_seq = 0
         read_engine_turn(self.process.stdout, READY, lambda _: None)
@@ -1796,10 +1799,52 @@ class Engine:
                                    "cpu": parts[0].strip() if len(parts)>0 else "",
                                    "gpu": parts[1].strip() if len(parts)>1 else ""}
                 elif kind == "EMAP" and len(fields) == 4:
-                    self.emap = {"rows": int(fields[1]), "cols": int(fields[2]), "map": fields[3]}
+                    snapshot = {"rows": int(fields[1]), "cols": int(fields[2]),
+                                "map": fields[3]}
+                    with self.telemetry_lock:
+                        self.emap = snapshot
                 elif kind == "HITS" and len(fields) == 4:
-                    self.hits = fields[3]
-                    self.hits_seq += 1
+                    with self.telemetry_lock:
+                        self.hits = fields[3]
+                        self.hits_seq += 1
+                elif kind == "LAYER" and len(fields) == 6:
+                    layer = int(fields[1])
+                    cols = int(fields[2])
+                    try:
+                        heat = bytes.fromhex(fields[3])
+                        hits = bytes.fromhex(fields[4])
+                        resident = bytes.fromhex(fields[5])
+                    except ValueError as error:
+                        raise RuntimeError("引擎 LAYER 帧包含无效十六进制数据") from error
+                    with self.telemetry_lock:
+                        if not self.emap:
+                            raise RuntimeError("引擎在 EMAP 之前发送了 LAYER 帧")
+                        rows = self.emap["rows"]
+                        if (not 0 <= layer < rows or cols != self.emap["cols"] or
+                                len(heat) != cols or len(hits) != (cols + 7) // 8 or
+                                len(resident) != (rows * cols + 7) // 8):
+                            raise RuntimeError("引擎 LAYER 帧尺寸无效")
+                        values = bytearray.fromhex(self.emap["map"])
+                        if len(values) != rows * cols:
+                            raise RuntimeError("引擎 EMAP 帧尺寸无效")
+                        for cell in range(len(values)):
+                            values[cell] &= 0x3f
+                            if resident[cell >> 3] & (1 << (cell & 7)):
+                                values[cell] |= 0x40
+                        base = layer * cols
+                        for expert, value in enumerate(heat):
+                            values[base + expert] = ((values[base + expert] & 0xc0) |
+                                                     (value & 0x3f))
+                        self.emap = {"rows": rows, "cols": cols, "map": values.hex()}
+                        self.hits = fields[4]
+                        self.hits_seq += 1
+                        self.expert_events.append({
+                            "seq": self.hits_seq,
+                            "row": layer,
+                            "map": fields[3],
+                            "hits": fields[4],
+                            "resident": fields[5],
+                        })
                 elif kind == "PROF" and len(fields) >= 10:
                     # per-turn phase timings: where the engine spent this turn's wall time
                     self.profile.append({
@@ -2112,6 +2157,11 @@ class APIHandler(BaseHTTPRequestHandler):
         self._raw_rfile = self.rfile
 
     def log_message(self, fmt, *args):
+        # 大脑页每 200ms 拉取一次增量；成功轮询属于内部心跳，逐条打印会淹没
+        # 真正的请求与错误。非 200 响应仍保留日志。
+        if (len(args) >= 2 and str(args[0]).startswith("GET /experts") and
+                str(args[1]) == "200"):
+            return
         sys.stderr.write("[api] %s - %s\n" % (self.address_string(), fmt % args))
 
     def handle_one_request(self):
@@ -2351,7 +2401,8 @@ class APIHandler(BaseHTTPRequestHandler):
         request_id = "req_" + uuid.uuid4().hex
         try:
             self._check_host()
-            path = urlsplit(self.path).path
+            target = urlsplit(self.path)
+            path = target.path
             if path == "/health":
                 # Liveness is always public; hardware/scheduler internals only when a
                 # request is authed (or no key set), so a configured key isn't leaked
@@ -2367,12 +2418,25 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.send_json(200, payload, request_id)
                 return
             if path == "/experts":
-                payload = {"rows": 0, "cols": 0, "map": "", "hits": "", "seq": 0}
+                payload = {"rows": 0, "cols": 0, "map": "", "hits": "",
+                           "seq": 0, "events": []}
                 eng = self.server.engine
                 if self._is_authed() and eng and getattr(eng, "emap", None):   # (#SEC-8) hide routing telemetry unless authed
-                    payload.update(eng.emap)
-                    payload["hits"] = eng.hits or ""
-                    payload["seq"] = eng.hits_seq
+                    try:
+                        after = int(parse_qs(target.query).get("after", ["0"])[0])
+                        if after < 0:
+                            raise ValueError
+                    except ValueError:
+                        raise APIError(400, "`after` 必须是非负整数。",
+                                       "after")
+                    lock = getattr(eng, "telemetry_lock", contextlib.nullcontext())
+                    with lock:
+                        payload.update(eng.emap)
+                        payload["hits"] = eng.hits or ""
+                        payload["seq"] = eng.hits_seq
+                        payload["events"] = [event.copy() for event in
+                                             getattr(eng, "expert_events", ())
+                                             if event["seq"] > after]
                 self.send_json(200, payload, request_id)
                 return
             if path == "/profile":
