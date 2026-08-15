@@ -381,8 +381,12 @@ def env_for_engine(a, arch):
         from resource_plan import physical_cpu_count
         env.setdefault("OMP_NUM_THREADS", str(physical_cpu_count()))
         if arch == "deepseek_v4":
-            env.setdefault("OMP_WAIT_POLICY", "active")
-            env.setdefault("GOMP_SPINCOUNT", "200000")
+            # LLVM libomp 在 macOS 上会把 active 等待变成持续自旋。空闲的
+            # Web 服务因此长期占用数个核心，而且项目已有实测表明它会拖慢
+            # Apple Silicon 的磁盘流式推理；沿用 GLM 路径验证过的 macOS 策略。
+            if sys.platform != "darwin":
+                env.setdefault("OMP_WAIT_POLICY", "active")
+                env.setdefault("GOMP_SPINCOUNT", "200000")
             env.setdefault("OMP_DYNAMIC", "FALSE")
             if sys.platform != "win32":
                 env.setdefault("OMP_PROC_BIND", "close")

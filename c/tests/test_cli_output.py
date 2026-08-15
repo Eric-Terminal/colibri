@@ -300,6 +300,18 @@ class OmpThreadsForEveryEngineTest(unittest.TestCase):
         self.assertEqual(env.get("OMP_WAIT_POLICY"), "active")
         self.assertEqual(env.get("OMP_DYNAMIC"), "FALSE")
 
+    def test_v4_darwin_does_not_spin_while_idle(self):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(self.coli.sys, "platform", "darwin"), \
+             mock.patch("resource_plan.physical_cpu_count", return_value=4):
+            env = self.coli.env_for_engine(self.args(), "deepseek_v4")
+        self.assertEqual(env.get("OMP_NUM_THREADS"), "4")
+        self.assertEqual(env.get("OMP_DYNAMIC"), "FALSE")
+        self.assertEqual(env.get("OMP_PROC_BIND"), "close")
+        self.assertEqual(env.get("OMP_PLACES"), "cores")
+        self.assertNotIn("OMP_WAIT_POLICY", env)
+        self.assertNotIn("GOMP_SPINCOUNT", env)
+
     def test_explicit_setting_still_wins(self):
         with mock.patch.dict(os.environ, {"OMP_NUM_THREADS": "3"}), \
              mock.patch("resource_plan.physical_cpu_count", return_value=6):

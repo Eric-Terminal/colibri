@@ -1676,8 +1676,11 @@ def tune_child_env(env, arch):
     if not env.get("COLI_NO_OMP_TUNE"):
         from resource_plan import physical_cpu_count
         env.setdefault("OMP_NUM_THREADS", str(physical_cpu_count()))
-        env.setdefault("OMP_WAIT_POLICY", "active")
-        env.setdefault("GOMP_SPINCOUNT", "200000")
+        # 与 coli 启动器保持一致：Apple Silicon 上 LLVM libomp 的 active
+        # 等待会让空闲服务持续占用整颗核心，且对磁盘流式解码有负收益。
+        if sys.platform != "darwin":
+            env.setdefault("OMP_WAIT_POLICY", "active")
+            env.setdefault("GOMP_SPINCOUNT", "200000")
         env.setdefault("OMP_DYNAMIC", "FALSE")
         if sys.platform != "win32":
             env.setdefault("OMP_PROC_BIND", "close")

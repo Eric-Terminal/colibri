@@ -804,6 +804,18 @@ class CapSentinelShimTest(unittest.TestCase):
         self.assertEqual(env["V4_MTP_GB"], "0.45")
         self.assertEqual(env["V4_MTP_CONF"], "0.7")  # explicit override wins
 
+    def test_direct_v4_server_does_not_spin_on_darwin(self):
+        env = {}
+        with patch("resource_plan.physical_cpu_count", return_value=4), \
+             patch("openai_server.sys.platform", "darwin"):
+            tune_child_env(env, "deepseek_v4")
+        self.assertEqual(env["OMP_NUM_THREADS"], "4")
+        self.assertEqual(env["OMP_DYNAMIC"], "FALSE")
+        self.assertEqual(env["OMP_PROC_BIND"], "close")
+        self.assertEqual(env["OMP_PLACES"], "cores")
+        self.assertNotIn("OMP_WAIT_POLICY", env)
+        self.assertNotIn("GOMP_SPINCOUNT", env)
+
 
 class HTTPTest(unittest.TestCase):
     @classmethod
