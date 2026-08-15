@@ -7,17 +7,24 @@ import { useLocale } from "./i18n"
 
 const PHASES = [
   { key: "expert_wait_s", i18n: "profile.ioWait", color: "#3987e5" },
+  { key: "dense_load_s", i18n: "profile.denseLoad", color: "#38bdf8" },
   { key: "expert_matmul_s", i18n: "profile.expertMatmul", color: "#199e70" },
+  { key: "shared_expert_s", i18n: "profile.sharedExpert", color: "#14b8a6" },
+  { key: "router_s", i18n: "profile.router", color: "#e879a8" },
   { key: "attention_s", i18n: "profile.attention", color: "#c98500" },
+  { key: "block_overhead_s", i18n: "profile.blockOverhead", color: "#84cc16" },
   { key: "lm_head_s", i18n: "profile.lmHead", color: "#008300" },
   { key: "other_s", i18n: "profile.other", color: "#9085e9" },
 ] as const
 
 interface Turn extends ProfileTurn { other_s: number; toks: number }
 
-const derive = (turn: ProfileTurn): Turn => ({
+export const deriveProfileTurn = (turn: ProfileTurn): Turn => ({
   ...turn,
-  other_s: Math.max(0, turn.wall_s - turn.expert_wait_s - turn.expert_matmul_s - turn.attention_s - turn.lm_head_s),
+  other_s: Math.max(0,
+    turn.wall_s - turn.expert_wait_s - turn.dense_load_s -
+    turn.expert_matmul_s - turn.shared_expert_s - turn.router_s -
+    turn.attention_s - turn.block_overhead_s - turn.lm_head_s),
   toks: turn.wall_s > 0 ? turn.completion_tokens / turn.wall_s : 0,
 })
 
@@ -87,7 +94,7 @@ export function Profiling({ baseUrl, apiKey, connected }: { baseUrl: string; api
       if (document.visibilityState === "hidden") return
       try {
         const result = await getProfile(baseUrl, apiKey)
-        if (!disposed) setTurns(result.turns.map(derive))
+        if (!disposed) setTurns(result.turns.map(deriveProfileTurn))
       } catch { /* engine busy or restarting — keep the last snapshot */ }
     }
     void poll()

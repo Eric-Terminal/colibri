@@ -95,10 +95,14 @@ const de: Record<string, string> = {
   // Profiling
   "profile.title": "Profiling – wo die Engine Zeit pro Zug verbringt",
   "profile.ioWait": "I/O-Wartezeit",
+  "profile.denseLoad": "Laden dichter Gewichte",
   "profile.expertMatmul": "Experten-Matmul",
+  "profile.sharedExpert": "Gemeinsamer Experte",
+  "profile.router": "Routing",
   "profile.attention": "Attention",
+  "profile.blockOverhead": "Norm / Residuum",
   "profile.lmHead": "LM-Head",
-  "profile.other": "Sonstiges",
+  "profile.other": "Planung / Sonstiges",
   "profile.empty": "Noch keine profilierten Züge – sende eine Chat-Nachricht, dann erscheint die Aufschlüsselung.",
   "profile.connectHint": "Verbinde dich mit der Engine, um Zeiten pro Zug zu erfassen.",
   "profile.lastTurn": "Letzter Zug",
@@ -116,7 +120,7 @@ const de: Record<string, string> = {
   "profile.wallCol": "Gesamt",
   "profile.turnsLabel": "{{n}} Züge · ältester → neuester",
   "profile.oneTurn": "1 Zug",
-  "profile.diskNote": "Datenträgerdienst ist die kumulierte Zeit zum Lesen der Experten. Im Normalmodus kann sie sich mit der Berechnung überlappen, daher fließt nur die tatsächliche Wartezeit des Rechenthreads in die Gesamtzeit ein; im Speichersparmodus wird synchron gelesen und dieselbe Zeit als I/O-Wartezeit ausgewiesen. Bei mehreren KV-Sitzungen beschreiben die Anteile die ganze Engine im Zeitfenster des Zuges.",
+  "profile.diskNote": "Datenträgerdienst ist die kumulierte Lesezeit der gerouteten Experten; das Laden dichter Gewichte misst separat das synchrone Laden der nicht gerouteten Gewichte jeder Schicht. Im Normalmodus können sich Experten-Lesevorgänge mit der Berechnung überlappen, daher fließt nur die tatsächliche Wartezeit des Rechenthreads in die Gesamtzeit ein; im Speichersparmodus wird synchron gelesen und dieselbe Zeit als I/O-Wartezeit ausgewiesen. Bei mehreren KV-Sitzungen beschreiben die Anteile die ganze Engine im Zeitfenster des Zuges.",
 
   // Fehlergrenze
   "error.title": "Die colibrì-Oberfläche hat einen Fehler festgestellt",

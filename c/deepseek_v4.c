@@ -3930,12 +3930,6 @@ double coli_v4_block_profile_now(void);
 void coli_v4_block_profile_add(int kind, double seconds);
 #endif
 
-/* #890: expert-forward compute accounting — defined in the expert-store unit,
- * called here around the matmul, read per-turn in the serve loop. Always on
- * (unlike the block profiler above), because the dashboard always needs it. */
-void coli_v4_expert_store_add_matmul(ColiExpertStore *store, double sec);
-double coli_v4_expert_store_matmul_sec(ColiExpertStore *store);
-
 static double v4_now_mono(void) {   /* #890 phase timing, same clock as disk_sec */
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -3948,7 +3942,8 @@ static int profiled_expert_forward(
     double began = v4_now_mono();
     int result = coli_v4_expert_forward_ref(
         output, expert, input, route_weight, swiglu_limit);
-    coli_v4_expert_store_add_matmul(store, v4_now_mono() - began);
+    coli_v4_expert_store_add_profile(
+        store, COLI_V4_PROFILE_ROUTED_EXPERT, v4_now_mono() - began);
     return result;
 }
 
@@ -4009,6 +4004,7 @@ static int moe_token_pipeline(float *output,
         free(expert_ids); free(indices); free(route_weights); free(gate);
         return -1;
     }
+    double route_began = v4_now_mono();
 #ifdef COLI_V4_DISABLE_BF16_ROUTE
 #ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
     double profile_gate_began = coli_v4_block_profile_now();
@@ -4049,6 +4045,8 @@ static int moe_token_pipeline(float *output,
         }
     }
     if (!result && selected != topk) result = -1;
+    coli_v4_expert_store_add_profile(
+        store, COLI_V4_PROFILE_ROUTER, v4_now_mono() - route_began);
 
 #ifdef COLI_V4_EXPERIMENTAL_PREFETCH
     if (!result && expert_prefetch_enabled() && store->ops->prefetch) {
@@ -4100,8 +4098,14 @@ static int moe_token_pipeline(float *output,
     if (!result && (fp8_view(&w1, weights, "ffn.shared_experts.w1") ||
                     fp8_view(&w2, weights, "ffn.shared_experts.w2") ||
                     fp8_view(&w3, weights, "ffn.shared_experts.w3"))) result = -1;
-    if (!result) result = coli_v4_shared_expert_forward_ref(
-        shared_output, &w1, &w2, &w3, input, config->swiglu_limit);
+    if (!result) {
+        double shared_began = v4_now_mono();
+        result = coli_v4_shared_expert_forward_ref(
+            shared_output, &w1, &w2, &w3, input, config->swiglu_limit);
+        coli_v4_expert_store_add_profile(
+            store, COLI_V4_PROFILE_SHARED_EXPERT,
+            v4_now_mono() - shared_began);
+    }
     if (!result) memset(output, 0, (size_t)d * sizeof(*output));
 
     if (coli_v4_low_memory_enabled()) {
@@ -4222,6 +4226,7 @@ static int block_token_pipeline(float *output_hc,
                                 char *error, size_t error_size) {
     if (!output_hc || !weights || !config || !experts || !input_hc)
         return set_error(error, error_size, "invalid block arguments");
+    double overhead_began = v4_now_mono();
     int d = config->hidden_size, hc = config->hc_mult;
     size_t hd = (size_t)hc * d;
     float *residual = malloc(hd * sizeof(*residual));
@@ -4239,11 +4244,23 @@ static int block_token_pipeline(float *output_hc,
     memcpy(residual, input_hc, hd * sizeof(*residual));
     int result = normalized_hc_pre(reduced, post, comb, normalized, input_hc,
                                    weights, config, "attn", "attn_norm.weight");
-    if (!result) result = attention
-        ? coli_v4_attention_window_token_ref(branch, attention, weights, config,
-                                             normalized, position, error, error_size)
-        : coli_v4_attention_token_ref(branch, weights, config, normalized,
-                                      position, error, error_size);
+    coli_v4_expert_store_add_profile(
+        experts, COLI_V4_PROFILE_BLOCK_OVERHEAD,
+        v4_now_mono() - overhead_began);
+    if (!result) {
+        double attention_began = v4_now_mono();
+        result = attention
+            ? coli_v4_attention_window_token_ref(
+                  branch, attention, weights, config, normalized,
+                  position, error, error_size)
+            : coli_v4_attention_token_ref(
+                  branch, weights, config, normalized,
+                  position, error, error_size);
+        coli_v4_expert_store_add_profile(
+            experts, COLI_V4_PROFILE_ATTENTION,
+            v4_now_mono() - attention_began);
+    }
+    overhead_began = v4_now_mono();
     if (!result) result = coli_v4_hc_post(state, branch, residual,
                                           post, comb, hc, d);
     if (!result) coli_bf16_round_array(state, hd);
@@ -4251,13 +4268,20 @@ static int block_token_pipeline(float *output_hc,
     if (!result) result = normalized_hc_pre(reduced, post, comb, normalized, state,
                                             weights, config, "ffn",
                                             "ffn_norm.weight");
+    coli_v4_expert_store_add_profile(
+        experts, COLI_V4_PROFILE_BLOCK_OVERHEAD,
+        v4_now_mono() - overhead_began);
     if (!result) result = moe_token_pipeline(branch, weights, config, experts,
                                              normalized, token);
+    overhead_began = v4_now_mono();
     if (!result) result = coli_v4_hc_post(output_hc, branch, residual,
                                           post, comb, hc, d);
     if (!result) coli_bf16_round_array(output_hc, hd);
     free(comb); free(post); free(branch); free(normalized);
     free(reduced); free(state); free(residual);
+    coli_v4_expert_store_add_profile(
+        experts, COLI_V4_PROFILE_BLOCK_OVERHEAD,
+        v4_now_mono() - overhead_began);
     return result ? set_error(error, error_size, "block computation failed") : 0;
 }
 
@@ -4338,6 +4362,7 @@ static int v4_moe_batch_union(
         free(indices); free(route_weights); free(gate);
         return -1;
     }
+    double route_began = v4_now_mono();
 #ifdef COLI_V4_DISABLE_BF16_ROUTE
     decode_bf16(gate, value(weights, "ffn.gate.weight", NULL), gate_count);
 #endif
@@ -4372,6 +4397,8 @@ static int v4_moe_batch_union(
                     result = -1;
             }
     }
+    coli_v4_expert_store_add_profile(
+        store, COLI_V4_PROFILE_ROUTER, v4_now_mono() - route_began);
 
     ColiTensorView w1, w2, w3;
     if (!result &&
@@ -4379,10 +4406,16 @@ static int v4_moe_batch_union(
          fp8_view(&w2, weights, "ffn.shared_experts.w2") ||
          fp8_view(&w3, weights, "ffn.shared_experts.w3")))
         result = -1;
-    for (int item = 0; !result && item < batch; item++)
-        result = coli_v4_shared_expert_forward_ref(
-            shared + (size_t)item * d, &w1, &w2, &w3,
-            inputs + (size_t)item * d, config->swiglu_limit);
+    if (!result) {
+        double shared_began = v4_now_mono();
+        for (int item = 0; !result && item < batch; item++)
+            result = coli_v4_shared_expert_forward_ref(
+                shared + (size_t)item * d, &w1, &w2, &w3,
+                inputs + (size_t)item * d, config->swiglu_limit);
+        coli_v4_expert_store_add_profile(
+            store, COLI_V4_PROFILE_SHARED_EXPERT,
+            v4_now_mono() - shared_began);
+    }
     if (!result)
         memset(outputs, 0, (size_t)batch * d * sizeof(*outputs));
 
@@ -4526,6 +4559,7 @@ int coli_v4_block_window_batch_ref(
     char *error, size_t error_size) {
     if (!outputs_hc || !attention || !weights || !config || !experts ||
         !inputs_hc || !tokens || batch < 1 || batch > 64) return -1;
+    double overhead_began = v4_now_mono();
     int d = config->hidden_size, hc = config->hc_mult;
     size_t hd = (size_t)hc * d;
     float *states = malloc((size_t)batch * hd * sizeof(*states));
@@ -4555,10 +4589,20 @@ int coli_v4_block_window_batch_ref(
             normalized + (size_t)item * d,
             inputs_hc + (size_t)item * hd,
             weights, config, "attn", "attn_norm.weight");
+    coli_v4_expert_store_add_profile(
+        experts, COLI_V4_PROFILE_BLOCK_OVERHEAD,
+        v4_now_mono() - overhead_began);
     phase = "attention";
-    if (!result) result = coli_v4_attention_window_batch_ref(
-        branches, attention, weights, config, normalized,
-        start_position, batch, error, error_size);
+    if (!result) {
+        double attention_began = v4_now_mono();
+        result = coli_v4_attention_window_batch_ref(
+            branches, attention, weights, config, normalized,
+            start_position, batch, error, error_size);
+        coli_v4_expert_store_add_profile(
+            experts, COLI_V4_PROFILE_ATTENTION,
+            v4_now_mono() - attention_began);
+    }
+    overhead_began = v4_now_mono();
     if (!result) phase = "attention post / FFN hyper-connection";
     for (int item = 0; !result && item < batch; item++) {
         float *state = states + (size_t)item * hd;
@@ -4575,6 +4619,9 @@ int coli_v4_block_window_batch_ref(
             ffn_normalized + (size_t)item * d, state,
             weights, config, "ffn", "ffn_norm.weight");
     }
+    coli_v4_expert_store_add_profile(
+        experts, COLI_V4_PROFILE_BLOCK_OVERHEAD,
+        v4_now_mono() - overhead_began);
     if (!result) phase = "MoE";
     if (!result && batch > 1 && v4_expert_union_enabled())
         result = v4_moe_batch_union(
@@ -4585,6 +4632,7 @@ int coli_v4_block_window_batch_ref(
             result = moe_token_pipeline(
                 ffn_branch + (size_t)item * d, weights, config, experts,
                 ffn_normalized + (size_t)item * d, tokens[item]);
+    overhead_began = v4_now_mono();
     if (!result) phase = "FFN hyper-connection post";
     for (int item = 0; !result && item < batch; item++) {
         result = coli_v4_hc_post(
@@ -4599,6 +4647,9 @@ int coli_v4_block_window_batch_ref(
     free(ffn_comb); free(ffn_post); free(ffn_branch); free(ffn_normalized);
     free(reduced); free(combs); free(posts); free(branches);
     free(normalized); free(states);
+    coli_v4_expert_store_add_profile(
+        experts, COLI_V4_PROFILE_BLOCK_OVERHEAD,
+        v4_now_mono() - overhead_began);
     if (!result) return 0;
     if (error && error_size && error[0]) return -1;
     return set_error(error, error_size, "hybrid batched block failed in %s", phase);
@@ -5798,9 +5849,8 @@ typedef struct {
     ColiExpertStoreStats stats;
     pthread_mutex_t mutex;
     double disk_sec;   /* cumulative wall time spent reading expert bytes from disk */
-    double matmul_sec; /* cumulative expert-forward compute time (#890): the phase the
-                        * dashboard needs alongside disk_sec so it stops folding
-                        * everything into "other". One shared instance per store. */
+    double profile_sec[COLI_V4_PROFILE_PHASES];
+    uint64_t profile_forwards;
     uint8_t *ehit;     /* layers*experts_per_layer: experts routed in the current turn */
     uint8_t *eheat;    /* layers*experts_per_layer: cumulative routing selections, capped 63 */
 } V4ExpertStoreState;
@@ -7029,26 +7079,46 @@ double coli_v4_expert_store_disk_sec(ColiExpertStore *store) {
     return value;
 }
 
-/* #890: the compute phase, accumulated by the MoE and read by the serve loop —
- * the disk_sec twin. add is called from the block units around expert forward;
- * the getter is read per-turn in v4_serve_one, same as disk_sec. */
-void coli_v4_expert_store_add_matmul(ColiExpertStore *store, double sec) {
-    if (!store || !store->state || sec <= 0.0) return;
+void coli_v4_expert_store_add_profile(ColiExpertStore *store,
+                                      ColiV4ProfilePhase phase,
+                                      double seconds) {
+    if (!store || !store->state || phase < 0 ||
+        phase >= COLI_V4_PROFILE_PHASES || seconds <= 0.0) return;
     V4ExpertStoreState *state = store->state;
     pthread_mutex_lock(&state->mutex);
-    state->matmul_sec += sec;
+    state->profile_sec[phase] += seconds;
     pthread_mutex_unlock(&state->mutex);
 }
-double coli_v4_expert_store_matmul_sec(ColiExpertStore *store) {
-    V4ExpertStoreState *state;
-    if (!store || !store->state) return 0.0;
-    state = store->state;
-    double value;
+
+void coli_v4_expert_store_add_forward(ColiExpertStore *store) {
+    if (!store || !store->state) return;
+    V4ExpertStoreState *state = store->state;
     pthread_mutex_lock(&state->mutex);
-    value = state->matmul_sec;
+    state->profile_forwards++;
     pthread_mutex_unlock(&state->mutex);
-    return value;
 }
+
+void coli_v4_expert_store_profile_snapshot(ColiExpertStore *store,
+                                           ColiV4ProfileCounters *output) {
+    if (!output) return;
+    memset(output, 0, sizeof(*output));
+    if (!store || !store->state) return;
+    V4ExpertStoreState *state = store->state;
+    pthread_mutex_lock(&state->mutex);
+    output->expert_matmul_s =
+        state->profile_sec[COLI_V4_PROFILE_ROUTED_EXPERT];
+    output->dense_load_s = state->profile_sec[COLI_V4_PROFILE_DENSE_LOAD];
+    output->attention_s = state->profile_sec[COLI_V4_PROFILE_ATTENTION];
+    output->router_s = state->profile_sec[COLI_V4_PROFILE_ROUTER];
+    output->shared_expert_s =
+        state->profile_sec[COLI_V4_PROFILE_SHARED_EXPERT];
+    output->block_overhead_s =
+        state->profile_sec[COLI_V4_PROFILE_BLOCK_OVERHEAD];
+    output->lm_head_s = state->profile_sec[COLI_V4_PROFILE_LM_HEAD];
+    output->forwards = state->profile_forwards;
+    pthread_mutex_unlock(&state->mutex);
+}
+
 #endif /* COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16 */
 
 #ifdef COLI_V4_UNIT_EXPERT_ROWS16
@@ -8309,8 +8379,13 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
     size_t hd = (size_t)config->hc_mult * config->hidden_size;
     for (int layer_id = 0; layer_id < config->num_hidden_layers; layer_id++) {
         ColiDeepSeekV4LayerWeights layer;
-        if (coli_v4_layer_load(engine, &layer, config, index, layer_id,
-                               error, error_size)) return -1;
+        double load_began = spec_now();
+        int load_result = coli_v4_layer_load(
+            engine, &layer, config, index, layer_id, error, error_size);
+        coli_v4_expert_store_add_profile(
+            experts, COLI_V4_PROFILE_DENSE_LOAD,
+            spec_now() - load_began);
+        if (load_result) return -1;
         int result = 0;
         /* Chunk width caps every batch-scaled buffer in the block AND bounds
          * the expert union: each chunk boundary re-reads the experts it
@@ -8348,6 +8423,7 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
     }
     *state_ptr = state;
     *next_ptr = next;
+    coli_v4_expert_store_add_forward(experts);
     return 0;
 }
 
@@ -8362,8 +8438,13 @@ static int target_token(ColiV4Engine *engine, float **state_ptr, float **next_pt
     if (load_embedding(state, index, config, token)) return -1;
     for (int layer_id = 0; layer_id < config->num_hidden_layers; layer_id++) {
         ColiDeepSeekV4LayerWeights layer;
-        if (coli_v4_layer_load(engine, &layer, config, index, layer_id,
-                               error, error_size)) return -1;
+        double load_began = spec_now();
+        int load_result = coli_v4_layer_load(
+            engine, &layer, config, index, layer_id, error, error_size);
+        coli_v4_expert_store_add_profile(
+            experts, COLI_V4_PROFILE_DENSE_LOAD,
+            spec_now() - load_began);
+        if (load_result) return -1;
         int result = coli_v4_block_window_token_ref(
             next, attention[layer_id], &layer, config, experts,
             state, token, position, error, error_size);
@@ -8376,6 +8457,7 @@ static int target_token(ColiV4Engine *engine, float **state_ptr, float **next_pt
     }
     *state_ptr = state;
     *next_ptr = next;
+    coli_v4_expert_store_add_forward(experts);
     return 0;
 }
 
@@ -9009,9 +9091,15 @@ int coli_v4_session_generate(ColiV4Session *session,
     const float *last = state + (size_t)(final_chunk - 1) * hd;
     int current = 0;
     float current_logit = 0.0f;
-    if (final_hidden(hidden, last, index, config, error, error_size) ||
+    double initial_head_began = spec_now();
+    int initial_head_result =
+        final_hidden(hidden, last, index, config, error, error_size) ||
         head_pick(engine, hidden, index, config, temperature, top_p,
-                  &session->rng_state, &current, &current_logit)) {
+                  &session->rng_state, &current, &current_logit);
+    coli_v4_expert_store_add_profile(
+        experts, COLI_V4_PROFILE_LM_HEAD,
+        spec_now() - initial_head_began);
+    if (initial_head_result) {
         kv_prefix_taint(&session->fed);
         return -1;
     }
@@ -9129,6 +9217,7 @@ int coli_v4_session_generate(ColiV4Session *session,
                         kv_prefix_taint(&session->fed);
                         return -1;
                     }
+                    double batch_head_began = spec_now();
                     float *batch_hidden = malloc(
                         (size_t)batch * config->hidden_size * sizeof(float));
                     int heads_ok = batch_hidden != NULL;
@@ -9142,6 +9231,9 @@ int coli_v4_session_generate(ColiV4Session *session,
                             engine, batch_hidden, index, config, batch,
                             predictions, logits)) heads_ok = 0;
                     free(batch_hidden);
+                    coli_v4_expert_store_add_profile(
+                        experts, COLI_V4_PROFILE_LM_HEAD,
+                        spec_now() - batch_head_began);
                     if (!heads_ok) {
                         (void)spec_attention_restore(
                             attention, snapshots, config->num_hidden_layers);
@@ -9264,9 +9356,15 @@ int coli_v4_session_generate(ColiV4Session *session,
         kv_prefix_record(&session->fed, &current, position, 1);
         session->state = state;
         session->next = next;
-        if (final_hidden(hidden, state, index, config, error, error_size) ||
+        double decode_head_began = spec_now();
+        int decode_head_result =
+            final_hidden(hidden, state, index, config, error, error_size) ||
             head_pick(engine, hidden, index, config, temperature, top_p,
-                      &session->rng_state, &current, &current_logit)) {
+                      &session->rng_state, &current, &current_logit);
+        coli_v4_expert_store_add_profile(
+            experts, COLI_V4_PROFILE_LM_HEAD,
+            spec_now() - decode_head_began);
+        if (decode_head_result) {
             kv_prefix_taint(&session->fed);
             return -1;
         }
@@ -9511,7 +9609,6 @@ extern void coli_v4_expert_store_emit_emap(ColiExpertStore *store);
 extern void coli_v4_expert_store_emit_hits(ColiExpertStore *store);
 extern void coli_v4_expert_store_emit_layer(ColiExpertStore *store, int layer);
 extern double coli_v4_expert_store_disk_sec(ColiExpertStore *store);
-extern double coli_v4_expert_store_matmul_sec(ColiExpertStore *store);   /* #890 */
 
 static void v4_hwinfo_emit(void) {
     char cpu[256] = "";
@@ -9552,18 +9649,18 @@ static void v4_hwinfo_emit(void) {
     fflush(stdout);
 }
 
-/* PROF wall_s prompt_tokens completion_tokens expert_disk_s expert_wait_s
- * expert_matmul_s attention_s lm_head_s forwards — disk (I/O) and matmul
- * (expert-forward compute) are the two phases the runtime tracks per turn
- * (#890); the frontend folds the remainder — attention, head, framing — into
- * "other". Before this the matmul field was hardcoded 0 and every turn read as
- * 100% other whenever the model sat warm in page cache. */
+/* 前十项保持现有 PROF 协议；尾部追加稠密权重加载、共享专家、路由和
+ * 层框架耗时，旧网关会自然忽略，新网关则能拆出 V4 的真实阶段。 */
 static void v4_prof_emit(double wall_s, int prompt_tokens, int completion,
                          double expert_disk_s, double expert_wait_s,
-                         double expert_matmul_s) {
-    printf("PROF %.6f %d %d %.6f %.6f %.6f 0.000000 0.000000 0\n",
+                         const ColiV4ProfileCounters *profile) {
+    printf("PROF %.6f %d %d %.6f %.6f %.6f %.6f %.6f %llu "
+           "%.6f %.6f %.6f %.6f\n",
            wall_s, prompt_tokens, completion, expert_disk_s, expert_wait_s,
-           expert_matmul_s);
+           profile->expert_matmul_s, profile->attention_s, profile->lm_head_s,
+           (unsigned long long)profile->forwards, profile->dense_load_s,
+           profile->shared_expert_s, profile->router_s,
+           profile->block_overhead_s);
     fflush(stdout);
 }
 
@@ -9715,12 +9812,12 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
     fflush(stdout);
 
     ColiExpertStoreStats before = {0}, after = {0};
+    ColiV4ProfileCounters profile_before = {0}, profile_after = {0};
     if (engine->experts && engine->experts->ops && engine->experts->ops->stats)
         engine->experts->ops->stats(engine->experts, &before);
+    coli_v4_expert_store_profile_snapshot(engine->experts, &profile_before);
     double disk_before =
         engine->experts ? coli_v4_expert_store_disk_sec(engine->experts) : 0.0;
-    double matmul_before =
-        engine->experts ? coli_v4_expert_store_matmul_sec(engine->experts) : 0.0;
     V4ServeStream stream = {session, engine->experts, request->id, 0};
     ColiV4SessionGenerateStats stats = {0};
     char error[512] = {0};
@@ -9744,6 +9841,7 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
     }
     if (engine->experts && engine->experts->ops && engine->experts->ops->stats)
         engine->experts->ops->stats(engine->experts, &after);
+    coli_v4_expert_store_profile_snapshot(engine->experts, &profile_after);
     uint64_t hits = after.hits - before.hits;
     uint64_t misses = after.misses - before.misses;
     double hit_rate = hits + misses ? 100.0 * hits / (hits + misses) : 0.0;
@@ -9765,14 +9863,24 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
     double expert_disk_s = engine->experts
         ? coli_v4_expert_store_disk_sec(engine->experts) - disk_before
         : 0.0;
-    double expert_matmul_s = engine->experts
-        ? coli_v4_expert_store_matmul_sec(engine->experts) - matmul_before
-        : 0.0;
+    ColiV4ProfileCounters profile = {
+        .expert_matmul_s = profile_after.expert_matmul_s -
+                           profile_before.expert_matmul_s,
+        .dense_load_s = profile_after.dense_load_s - profile_before.dense_load_s,
+        .attention_s = profile_after.attention_s - profile_before.attention_s,
+        .router_s = profile_after.router_s - profile_before.router_s,
+        .shared_expert_s = profile_after.shared_expert_s -
+                           profile_before.shared_expert_s,
+        .block_overhead_s = profile_after.block_overhead_s -
+                            profile_before.block_overhead_s,
+        .lm_head_s = profile_after.lm_head_s - profile_before.lm_head_s,
+        .forwards = profile_after.forwards - profile_before.forwards,
+    };
     /* 低内存模式在计算线程中同步换入专家，磁盘服务时间就是该线程真实
      * 等待的时间；普通模式由加载线程预取，二者可能重叠，不能重复扣除。 */
     double expert_wait_s = engine->runtime.low_memory ? expert_disk_s : 0.0;
     v4_prof_emit(elapsed, stats.prompt_tokens, completion,
-                 expert_disk_s, expert_wait_s, expert_matmul_s);
+                 expert_disk_s, expert_wait_s, &profile);
     coli_v4_expert_store_emit_emap(engine->experts);
     coli_v4_expert_store_emit_tiers(engine->experts);
 }

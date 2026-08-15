@@ -1869,6 +1869,10 @@ class Engine:
                         "attention_s": float(fields[7]),
                         "lm_head_s": float(fields[8]),
                         "forwards": int(fields[9]),
+                        "dense_load_s": float(fields[10]) if len(fields) > 10 else 0.0,
+                        "shared_expert_s": float(fields[11]) if len(fields) > 11 else 0.0,
+                        "router_s": float(fields[12]) if len(fields) > 12 else 0.0,
+                        "block_overhead_s": float(fields[13]) if len(fields) > 13 else 0.0,
                     })
                     self.profile_seq += 1
                 elif kind == "TIERS" and len(fields) >= 6:

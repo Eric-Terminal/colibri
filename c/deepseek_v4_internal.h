@@ -543,6 +543,36 @@ int coli_deepseek_v4_expert_store_open(
     char *error,
     size_t error_size);
 
+typedef enum {
+    COLI_V4_PROFILE_ROUTED_EXPERT,
+    COLI_V4_PROFILE_DENSE_LOAD,
+    COLI_V4_PROFILE_ATTENTION,
+    COLI_V4_PROFILE_ROUTER,
+    COLI_V4_PROFILE_SHARED_EXPERT,
+    COLI_V4_PROFILE_BLOCK_OVERHEAD,
+    COLI_V4_PROFILE_LM_HEAD,
+    COLI_V4_PROFILE_PHASES,
+} ColiV4ProfilePhase;
+
+typedef struct {
+    double expert_matmul_s;
+    double dense_load_s;
+    double attention_s;
+    double router_s;
+    double shared_expert_s;
+    double block_overhead_s;
+    double lm_head_s;
+    uint64_t forwards;
+} ColiV4ProfileCounters;
+
+/* 性能计数跟随专家仓库存在，使分块计算与请求入口能够共享同一组单调计数。 */
+void coli_v4_expert_store_add_profile(ColiExpertStore *store,
+                                      ColiV4ProfilePhase phase,
+                                      double seconds);
+void coli_v4_expert_store_add_forward(ColiExpertStore *store);
+void coli_v4_expert_store_profile_snapshot(ColiExpertStore *store,
+                                           ColiV4ProfileCounters *output);
+
 #ifdef __cplusplus
 }
 #endif

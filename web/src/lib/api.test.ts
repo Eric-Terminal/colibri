@@ -42,6 +42,8 @@ describe("runtime API", () => {
       wall_s: 2.5, prompt_tokens: 7, completion_tokens: 12,
       expert_disk_s: 0.4, expert_wait_s: 0.1, expert_matmul_s: 0.9,
       attention_s: 0.6, lm_head_s: 0.2, forwards: 15,
+      dense_load_s: 0.3, shared_expert_s: 0.25, router_s: 0.05,
+      block_overhead_s: 0.4,
     }
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ seq: 1, turns: [turn] })))
     vi.stubGlobal("fetch", fetchMock)

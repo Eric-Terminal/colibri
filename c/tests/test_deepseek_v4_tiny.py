@@ -232,6 +232,16 @@ def check_serve(binary: Path, model: Path, case: dict[str, object]) -> None:
             if profile["expert_matmul_s"] <= 0:
                 raise AssertionError(
                     f"serve round {ordinal}: expert compute was not timed: {profile}")
+            for phase in (
+                "dense_load_s", "shared_expert_s", "router_s",
+                "attention_s", "block_overhead_s", "lm_head_s",
+            ):
+                if profile[phase] <= 0:
+                    raise AssertionError(
+                        f"serve round {ordinal}: {phase} was not timed: {profile}")
+            if profile["forwards"] <= 0:
+                raise AssertionError(
+                    f"serve round {ordinal}: forwards were not counted: {profile}")
             if (profile["expert_disk_s"] <= 0 or
                     abs(profile["expert_wait_s"] - profile["expert_disk_s"]) > 0.001):
                 raise AssertionError(

@@ -95,10 +95,14 @@ const en: Record<string, string> = {
   // profiling
   "profile.title": "Profiling — where the engine spends each turn",
   "profile.ioWait": "I/O wait",
+  "profile.denseLoad": "Dense weight load",
   "profile.expertMatmul": "Expert matmul",
+  "profile.sharedExpert": "Shared expert",
+  "profile.router": "Routing",
   "profile.attention": "Attention",
+  "profile.blockOverhead": "Norm / residual",
   "profile.lmHead": "LM head",
-  "profile.other": "Other",
+  "profile.other": "Scheduling / other",
   "profile.empty": "No profiled turns yet — send a chat message and the breakdown appears here.",
   "profile.connectHint": "Connect to the engine to collect per-turn timings.",
   "profile.lastTurn": "Last turn",
@@ -116,7 +120,7 @@ const en: Record<string, string> = {
   "profile.wallCol": "Wall",
   "profile.turnsLabel": "{{n}} turns · oldest → newest",
   "profile.oneTurn": "1 turn",
-  "profile.diskNote": "Disk service is cumulative expert read time. Normal mode may overlap it with compute, so only the wait felt by the compute thread enters the wall-time stack; low-memory mode reads synchronously and reports the same time as I/O wait. With multiple KV sessions the shares describe the whole engine over the turn's window.",
+  "profile.diskNote": "Disk service is cumulative routed-expert read time; dense weight load separately measures synchronous loading of each layer's non-routed weights. Normal mode may overlap expert reads with compute, so only the wait felt by the compute thread enters the wall-time stack; low-memory mode reads synchronously and reports the same time as I/O wait. With multiple KV sessions the shares describe the whole engine over the turn's window.",
 
   // error boundary
   "error.title": "colibrì UI hit an error",

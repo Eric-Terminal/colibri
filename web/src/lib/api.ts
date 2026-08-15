@@ -59,6 +59,10 @@ export interface ProfileTurn {
   attention_s: number
   lm_head_s: number
   forwards: number
+  dense_load_s: number
+  shared_expert_s: number
+  router_s: number
+  block_overhead_s: number
 }
 
 export interface ProfileResponse {

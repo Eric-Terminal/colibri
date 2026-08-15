@@ -604,7 +604,10 @@ class DispatcherTest(unittest.TestCase):
         def respond(process, frame):
             request_id = frame.split()[1]
             process.stdout.feed(b"DATA " + request_id + b" 2\nok\n")
-            process.stdout.feed(b"PROF 2.500 7 12 0.400 0.100 0.900 0.600 0.200 15\n")
+            process.stdout.feed(
+                b"PROF 2.500 7 12 0.400 0.100 0.900 0.600 0.200 15 "
+                b"0.300 0.250 0.050 0.400\n"
+            )
             process.stdout.feed(b"DONE " + request_id + b" STAT 12 4.8 0 1.0 7 0\n")
 
         process = FakeProcess(respond)
@@ -617,7 +620,27 @@ class DispatcherTest(unittest.TestCase):
             "wall_s": 2.5, "prompt_tokens": 7, "completion_tokens": 12,
             "expert_disk_s": 0.4, "expert_wait_s": 0.1, "expert_matmul_s": 0.9,
             "attention_s": 0.6, "lm_head_s": 0.2, "forwards": 15,
+            "dense_load_s": 0.3, "shared_expert_s": 0.25, "router_s": 0.05,
+            "block_overhead_s": 0.4,
         }])
+
+    def test_legacy_prof_lines_default_extended_phases_to_zero(self):
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"PROF 1.000 2 3 0.100 0.100 0.200 0.300 0.050 4\n")
+            process.stdout.feed(b"DONE " + request_id + b" STAT 3 3.0 0 1.0 2 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        engine.generate("hello", 4, 0.0, 1.0, lambda _: None)
+        engine.close()
+        turn = list(engine.profile)[0]
+        self.assertEqual(
+            (turn["dense_load_s"], turn["shared_expert_s"], turn["router_s"],
+             turn["block_overhead_s"]),
+            (0.0, 0.0, 0.0, 0.0),
+        )
 
     def test_cancels_generation_after_consumer_disconnects(self):
         request_id = None
@@ -892,7 +915,9 @@ class HTTPTest(unittest.TestCase):
         """
         turn = {"wall_s": 2.5, "prompt_tokens": 7, "completion_tokens": 12,
                 "expert_disk_s": 0.4, "expert_wait_s": 0.1, "expert_matmul_s": 0.9,
-                "attention_s": 0.6, "lm_head_s": 0.2, "forwards": 15}
+                "attention_s": 0.6, "lm_head_s": 0.2, "forwards": 15,
+                "dense_load_s": 0.3, "shared_expert_s": 0.25, "router_s": 0.05,
+                "block_overhead_s": 0.4}
         self.engine.profile = [turn]
         self.engine.profile_seq = 1
         try:
