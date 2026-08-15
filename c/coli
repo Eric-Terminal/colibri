@@ -1150,11 +1150,9 @@ def cmd_chat(a):
     if arch!="glm":
         engine=engine_for(a.model)
         need_model(a.model,engine)
-        model_id=("kimi-k3-colibri" if arch=="kimi" else
-                  "inkling-colibri" if arch=="inkling" else
-                  "olmoe-colibri" if arch=="olmoe" else "deepseek-v4-colibri")
-        banner(f"chat · {model_id} · local server", model=a.model)
         import openai_server
+        model_id=openai_server.default_model_id(arch)
+        banner(f"chat · {model_id} · local server", model=a.model)
         # --cap rides along so an explicit `coli chat --cap N` reaches the
         # engine (it was silently eaten for years -- disclosed behavior
         # change); absent stays absent, and openai_server translates the
@@ -1348,11 +1346,7 @@ def cmd_serve(a):
     except OSError: pass
     import openai_server
     openai_server.ARCH=arch
-    model_id=a.model_id or ("kimi-k3-colibri" if arch=="kimi" else
-                            "inkling-colibri" if arch=="inkling" else
-                            "deepseek-v4-colibri" if arch=="deepseek_v4" else
-                            "olmoe-colibri" if arch=="olmoe" else
-                            "glm-5.2-colibri")
+    model_id=a.model_id or openai_server.default_model_id(arch)
     try:
         if a.temp is not None: os.environ["COLI_TEMP"] = str(a.temp)
         openai_server.serve(a.model,a.host,a.port,model_id,a.api_key,

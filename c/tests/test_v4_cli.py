@@ -50,6 +50,14 @@ class V4CliTest(unittest.TestCase):
         finally:
             directory.cleanup()
 
+    def test_v4_uses_flash_name_as_default_api_model_id(self):
+        import openai_server
+
+        self.assertEqual(
+            openai_server.default_model_id("deepseek_v4"),
+            "deepseek-v4-flash",
+        )
+
     def test_model_arch_selects_olmoe(self):
         directory, root = self.make_model("olmoe")
         try:

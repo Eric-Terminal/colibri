@@ -54,6 +54,15 @@ DEFAULT_CORS_ORIGINS = (
 )
 
 
+def default_model_id(arch):
+    return {
+        "inkling": "inkling-colibri",
+        "kimi": "kimi-k3-colibri",
+        "deepseek_v4": "deepseek-v4-flash",
+        "olmoe": "olmoe-colibri",
+    }.get(arch, "glm-5.2-colibri")
+
+
 class APIError(Exception):
     def __init__(self, status, message, param=None, code=None, error_type="invalid_request_error",
                  headers=None):
@@ -3202,11 +3211,7 @@ def main():
     if ARCH == "auto":
         ARCH = model_arch(args.model)
     if args.model_id is None:
-        args.model_id = ("inkling-colibri" if ARCH == "inkling" else
-                         "kimi-k3-colibri" if ARCH == "kimi" else
-                         "deepseek-v4-colibri" if ARCH == "deepseek_v4" else
-                         "olmoe-colibri" if ARCH == "olmoe" else
-                         "glm-5.2-colibri")
+        args.model_id = default_model_id(ARCH)
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,
           max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots,
