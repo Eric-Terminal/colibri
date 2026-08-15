@@ -107,7 +107,7 @@ const de: Record<string, string> = {
   "profile.batching": "Batching",
   "profile.tokensPerForward": "Tokens / Forward",
   "profile.diskService": "Datenträgerdienst",
-  "profile.overlapped": "mit Berechnung überlappt",
+  "profile.overlapped": "reine Experten-Lesezeit",
   "profile.window": "Fenster · letzte {{n}} Züge",
   "profile.throughputTitle": "Durchsatz pro Zug (Tok/s)",
   "profile.phaseTitle": "Gesamtzeit pro Zug nach Phase (s)",
@@ -116,7 +116,7 @@ const de: Record<string, string> = {
   "profile.wallCol": "Gesamt",
   "profile.turnsLabel": "{{n}} Züge · ältester → neuester",
   "profile.oneTurn": "1 Zug",
-  "profile.diskNote": "Datenträgerdienst ist die Zeit zum Lesen von Experten in I/O-Threads; sie überlappt mit der Berechnung. Nur die I/O-Wartezeit des Rechenthreads fließt in die Gesamtzeit ein. Bei mehreren KV-Sitzungen beschreiben die Anteile die ganze Engine im Zeitfenster des Zuges.",
+  "profile.diskNote": "Datenträgerdienst ist die kumulierte Zeit zum Lesen der Experten. Im Normalmodus kann sie sich mit der Berechnung überlappen, daher fließt nur die tatsächliche Wartezeit des Rechenthreads in die Gesamtzeit ein; im Speichersparmodus wird synchron gelesen und dieselbe Zeit als I/O-Wartezeit ausgewiesen. Bei mehreren KV-Sitzungen beschreiben die Anteile die ganze Engine im Zeitfenster des Zuges.",
 
   // Fehlergrenze
   "error.title": "Die colibrì-Oberfläche hat einen Fehler festgestellt",

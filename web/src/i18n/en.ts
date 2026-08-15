@@ -107,7 +107,7 @@ const en: Record<string, string> = {
   "profile.batching": "Batching",
   "profile.tokensPerForward": "tokens / forward",
   "profile.diskService": "Disk service",
-  "profile.overlapped": "overlapped with compute",
+  "profile.overlapped": "raw expert read time",
   "profile.window": "Window · last {{n}} turns",
   "profile.throughputTitle": "Throughput per turn (tok/s)",
   "profile.phaseTitle": "Turn wall time by phase (s)",
@@ -116,7 +116,7 @@ const en: Record<string, string> = {
   "profile.wallCol": "Wall",
   "profile.turnsLabel": "{{n}} turns · oldest → newest",
   "profile.oneTurn": "1 turn",
-  "profile.diskNote": "Disk service is time spent reading experts on I/O threads; it overlaps with compute, so only the I/O wait the compute thread felt counts inside the wall-time stack. With multiple KV sessions the shares describe the whole engine over the turn's window.",
+  "profile.diskNote": "Disk service is cumulative expert read time. Normal mode may overlap it with compute, so only the wait felt by the compute thread enters the wall-time stack; low-memory mode reads synchronously and reports the same time as I/O wait. With multiple KV sessions the shares describe the whole engine over the turn's window.",
 
   // error boundary
   "error.title": "colibrì UI hit an error",

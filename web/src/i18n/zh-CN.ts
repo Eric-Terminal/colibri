@@ -96,7 +96,7 @@ const zhCN: Record<string, string> = {
   "profile.batching": "批处理",
   "profile.tokensPerForward": "tokens / 前向",
   "profile.diskService": "磁盘服务",
-  "profile.overlapped": "与计算重叠",
+  "profile.overlapped": "专家原始读取耗时",
   "profile.window": "窗口 · 最近 {{n}} 轮",
   "profile.throughputTitle": "每轮吞吐量 (tok/s)",
   "profile.phaseTitle": "每轮各阶段耗时 (s)",
@@ -105,7 +105,7 @@ const zhCN: Record<string, string> = {
   "profile.wallCol": "总耗时",
   "profile.turnsLabel": "{{n}} 轮 · 从旧到新",
   "profile.oneTurn": "1 轮",
-  "profile.diskNote": "磁盘服务是在 I/O 线程上读取专家的时间；它与计算重叠，因此只有计算线程实际感受到的 I/O 等待 才计入总耗时分解。多 KV 会话时，份额描述的是整个引擎在该轮窗口内的表现。",
+  "profile.diskNote": "磁盘服务是读取专家的累计耗时。普通模式可以让读取与计算重叠，因此只有计算线程实际感受到的等待才计入总耗时分解；低内存模式会同步读取，磁盘服务时间也会计入 I/O 等待。多 KV 会话时，份额描述的是整个引擎在该轮窗口内的表现。",
 
   "error.title": "colibrì UI 遇到错误",
   "error.hint": "引擎不受影响。请尝试刷新页面。",

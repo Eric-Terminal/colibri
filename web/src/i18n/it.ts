@@ -96,7 +96,7 @@ const it: Record<string, string> = {
   "profile.batching": "Batching",
   "profile.tokensPerForward": "token / forward",
   "profile.diskService": "Servizio disco",
-  "profile.overlapped": "sovrapposto al calcolo",
+  "profile.overlapped": "tempo di lettura effettivo",
   "profile.window": "Finestra · ultimi {{n}} turni",
   "profile.throughputTitle": "Throughput per turno (tok/s)",
   "profile.phaseTitle": "Tempo per turno per fase (s)",
@@ -105,7 +105,7 @@ const it: Record<string, string> = {
   "profile.wallCol": "Totale",
   "profile.turnsLabel": "{{n}} turni · dal meno al più recente",
   "profile.oneTurn": "1 turno",
-  "profile.diskNote": "Il servizio disco è il tempo speso a leggere gli expert sui thread I/O; si sovrappone al calcolo, quindi solo l'attesa I/O effettivamente percepita dal thread di calcolo conta nella ripartizione del tempo totale. Con più sessioni KV, le quote descrivono l'intero motore nella finestra del turno.",
+  "profile.diskNote": "Il servizio disco è il tempo cumulativo di lettura degli expert. In modalità normale può sovrapporsi al calcolo, quindi solo l'attesa percepita dal thread di calcolo entra nella ripartizione del tempo totale; la modalità a memoria ridotta legge in modo sincrono e riporta lo stesso tempo come attesa I/O. Con più sessioni KV, le quote descrivono l'intero motore nella finestra del turno.",
 
   "error.title": "L'interfaccia colibrì ha riscontrato un errore",
   "error.hint": "Il motore non è stato coinvolto. Prova a ricaricare la pagina.",

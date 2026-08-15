@@ -3942,6 +3942,16 @@ static double v4_now_mono(void) {   /* #890 phase timing, same clock as disk_sec
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
+static int profiled_expert_forward(
+        ColiExpertStore *store, float *output, const ColiExpertView *expert,
+        const float *input, float route_weight, float swiglu_limit) {
+    double began = v4_now_mono();
+    int result = coli_v4_expert_forward_ref(
+        output, expert, input, route_weight, swiglu_limit);
+    coli_v4_expert_store_add_matmul(store, v4_now_mono() - began);
+    return result;
+}
+
 static int profiled_expert_load_start(ExpertLoadHandle *handle,
                                       ExpertLoadJob *job) {
 #ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
@@ -4108,9 +4118,9 @@ static int moe_token_pipeline(float *output,
                 result = -1;
                 break;
             }
-            result = coli_v4_expert_forward_ref(
-                expert_output, &expert, input, expert_weights[current],
-                config->swiglu_limit);
+            result = profiled_expert_forward(
+                store, expert_output, &expert, input,
+                expert_weights[current], config->swiglu_limit);
             coli_expert_release(store, &expert);
             if (!result)
                 for (int i = 0; i < d; i++) output[i] += expert_output[i];
@@ -4141,11 +4151,9 @@ static int moe_token_pipeline(float *output,
                 loader_active[slot] = 1;
         }
         if (!result) {
-            double mm0 = v4_now_mono();
-            result = coli_v4_expert_forward_ref(
-                expert_output, &expert, input, expert_weights[current],
-                config->swiglu_limit);
-            coli_v4_expert_store_add_matmul(store, v4_now_mono() - mm0);
+            result = profiled_expert_forward(
+                store, expert_output, &expert, input,
+                expert_weights[current], config->swiglu_limit);
         }
         coli_expert_release(store, &expert);
         if (!result)
@@ -4178,11 +4186,9 @@ static int moe_token_pipeline(float *output,
                 loader_active = 1;
         }
         if (!result) {
-            double mm0 = v4_now_mono();
-            result = coli_v4_expert_forward_ref(
-                expert_output, &expert, input, expert_weights[current],
-                config->swiglu_limit);
-            coli_v4_expert_store_add_matmul(store, v4_now_mono() - mm0);
+            result = profiled_expert_forward(
+                store, expert_output, &expert, input,
+                expert_weights[current], config->swiglu_limit);
         }
         coli_expert_release(store, &expert);
         if (!result)
@@ -4396,8 +4402,9 @@ static int v4_moe_batch_union(
             for (int item = 0; !result && item < batch; item++)
                 for (int rank = 0; !result && rank < topk; rank++) {
                     if (indices[(size_t)item * topk + rank] != expert) continue;
-                    result = coli_v4_expert_forward_ref(
-                        expert_output, &view, inputs + (size_t)item * d,
+                    result = profiled_expert_forward(
+                        store, expert_output, &view,
+                        inputs + (size_t)item * d,
                         route_weights[(size_t)item * topk + rank],
                         config->swiglu_limit);
                     if (!result)
@@ -4449,8 +4456,9 @@ static int v4_moe_batch_union(
         for (int item = 0; !result && item < batch; item++)
             for (int rank = 0; !result && rank < topk; rank++) {
                 if (indices[(size_t)item * topk + rank] != expert) continue;
-                result = coli_v4_expert_forward_ref(
-                    expert_output, &view, inputs + (size_t)item * d,
+                result = profiled_expert_forward(
+                    store, expert_output, &view,
+                    inputs + (size_t)item * d,
                     route_weights[(size_t)item * topk + rank],
                     config->swiglu_limit);
                 if (!result)
@@ -4477,8 +4485,9 @@ static int v4_moe_batch_union(
         for (int item = 0; !result && item < batch; item++)
             for (int rank = 0; !result && rank < topk; rank++) {
                 if (indices[(size_t)item * topk + rank] != expert) continue;
-                result = coli_v4_expert_forward_ref(
-                    expert_output, &view, inputs + (size_t)item * d,
+                result = profiled_expert_forward(
+                    store, expert_output, &view,
+                    inputs + (size_t)item * d,
                     route_weights[(size_t)item * topk + rank],
                     config->swiglu_limit);
                 if (!result)
@@ -9550,9 +9559,11 @@ static void v4_hwinfo_emit(void) {
  * "other". Before this the matmul field was hardcoded 0 and every turn read as
  * 100% other whenever the model sat warm in page cache. */
 static void v4_prof_emit(double wall_s, int prompt_tokens, int completion,
-                         double expert_disk_s, double expert_matmul_s) {
-    printf("PROF %.3f %d %d %.3f 0.000 %.3f 0.000 0.000 0\n",
-           wall_s, prompt_tokens, completion, expert_disk_s, expert_matmul_s);
+                         double expert_disk_s, double expert_wait_s,
+                         double expert_matmul_s) {
+    printf("PROF %.6f %d %d %.6f %.6f %.6f 0.000000 0.000000 0\n",
+           wall_s, prompt_tokens, completion, expert_disk_s, expert_wait_s,
+           expert_matmul_s);
     fflush(stdout);
 }
 
@@ -9757,8 +9768,11 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
     double expert_matmul_s = engine->experts
         ? coli_v4_expert_store_matmul_sec(engine->experts) - matmul_before
         : 0.0;
+    /* 低内存模式在计算线程中同步换入专家，磁盘服务时间就是该线程真实
+     * 等待的时间；普通模式由加载线程预取，二者可能重叠，不能重复扣除。 */
+    double expert_wait_s = engine->runtime.low_memory ? expert_disk_s : 0.0;
     v4_prof_emit(elapsed, stats.prompt_tokens, completion,
-                 expert_disk_s, expert_matmul_s);
+                 expert_disk_s, expert_wait_s, expert_matmul_s);
     coli_v4_expert_store_emit_emap(engine->experts);
     coli_v4_expert_store_emit_tiers(engine->experts);
 }

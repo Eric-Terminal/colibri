@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -222,6 +223,19 @@ def check_serve(binary: Path, model: Path, case: dict[str, object]) -> None:
                 )
             if stats["prompt_tokens"] != len(case["prompt_ids"]):
                 raise AssertionError(f"serve round {ordinal}: bad prompt stats {stats}")
+            deadline = time.monotonic() + 1.0
+            while len(engine.profile) <= ordinal and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if len(engine.profile) <= ordinal:
+                raise AssertionError(f"serve round {ordinal}: missing PROF telemetry")
+            profile = list(engine.profile)[ordinal]
+            if profile["expert_matmul_s"] <= 0:
+                raise AssertionError(
+                    f"serve round {ordinal}: expert compute was not timed: {profile}")
+            if (profile["expert_disk_s"] <= 0 or
+                    abs(profile["expert_wait_s"] - profile["expert_disk_s"]) > 0.001):
+                raise AssertionError(
+                    f"serve round {ordinal}: synchronous disk wait is wrong: {profile}")
             if ordinal == 0:
                 if not live_telemetry:
                     raise AssertionError("serve round 0: telemetry did not arrive before token data")
