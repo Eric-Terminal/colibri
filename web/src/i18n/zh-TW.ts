@@ -70,7 +70,7 @@ const zhTW: Record<string, string> = {
   "brain.waiting": "等待引擎連線",
   "brain.layers": "{{rows}} 層 × {{cols}} 專家",
   "brain.brightnessHint": "亮度 = 路由熱度",
-  "brain.flashHint": "⚡ 白色閃爍 = 本輪被路由",
+  "brain.flashHint": "⚡ 白色閃爍 = 目前層被路由",
   "brain.connectHint": "連線引擎以檢視皮層。",
   "brain.neverRouted": "從未被路由",
   "brain.selections": "約 2^{{heat}} 次選擇",

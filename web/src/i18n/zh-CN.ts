@@ -70,7 +70,7 @@ const zhCN: Record<string, string> = {
   "brain.waiting": "等待引擎连接",
   "brain.layers": "{{rows}} 层 × {{cols}} 专家",
   "brain.brightnessHint": "亮度 = 路由热度",
-  "brain.flashHint": "⚡ 白色闪烁 = 本轮被路由",
+  "brain.flashHint": "⚡ 白色闪烁 = 当前层被路由",
   "brain.connectHint": "连接引擎以查看皮层。",
   "brain.neverRouted": "从未被路由",
   "brain.selections": "约 2^{{heat}} 次选择",

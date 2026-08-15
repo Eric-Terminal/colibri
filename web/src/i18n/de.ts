@@ -80,7 +80,7 @@ const de: Record<string, string> = {
   "brain.waiting": "warte auf Engine",
   "brain.layers": "{{rows}} Schichten × {{cols}} Experten",
   "brain.brightnessHint": "Helligkeit = Routing-Aktivität",
-  "brain.flashHint": "⚡ weißes Blinken = in diesem Zug geroutet",
+  "brain.flashHint": "⚡ weißes Blinken = in der aktuellen Schicht geroutet",
   "brain.connectHint": "Verbinde dich mit der Engine, um den Kortex zu sehen.",
   "brain.neverRouted": "nie geroutet",
   "brain.selections": "~2^{{heat}} Auswahlen",

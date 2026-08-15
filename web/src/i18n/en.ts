@@ -80,7 +80,7 @@ const en: Record<string, string> = {
   "brain.waiting": "waiting for engine",
   "brain.layers": "{{rows}} layers × {{cols}} experts",
   "brain.brightnessHint": "brightness = routing heat",
-  "brain.flashHint": "⚡ white flash = routed this turn",
+  "brain.flashHint": "⚡ white flash = routed in the current layer",
   "brain.connectHint": "Connect to the engine to see the cortex.",
   "brain.neverRouted": "never routed",
   "brain.selections": "~2^{{heat}} selections",

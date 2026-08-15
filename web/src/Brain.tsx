@@ -2,13 +2,14 @@ import { useEffect, useRef, useState } from "react"
 import { BrainCircuit, Flame, Layers } from "lucide-react"
 
 import { endpoint } from "@/lib/api"
+import { applyLayerEvent, type ExpertLayerEvent, type ExpertMap } from "@/lib/brain"
 import { useLocale } from "./i18n"
 
-interface ExpertMap { rows: number; cols: number; map: string; hits: string; seq: number }
 interface AtlasEntry { affinity: Record<string, number>; entropy: number; top: string; label: string }
 
 const TIER_KEYS = ["tier.disk", "tier.ram", "tier.vram"] as const
 const TIER_RGB: [number, number, number][] = [[58, 71, 80], [90, 155, 216], [78, 214, 165]]
+const LAYER_FRAME_MS = 55
 
 function depthRoleKey(row: number, rows: number, isMtp: boolean): string {
   if (isMtp) return "brain.mtp"
@@ -32,6 +33,9 @@ export function Brain({ baseUrl, apiKey, connected }: { baseUrl: string; apiKey:
   const pulseRef = useRef<Float32Array | null>(null)   // per-expert pulse intensity 0..1
   const lastSeq = useRef(0)
   const rafRef = useRef(0)
+  const eventQueue = useRef<ExpertLayerEvent[]>([])
+  const playbackTimer = useRef<number | null>(null)
+  const latestSnapshot = useRef<ExpertMap | null>(null)
 
   // load the expert atlas if published (measured topic affinity, #175)
   useEffect(() => {
@@ -55,30 +59,96 @@ export function Brain({ baseUrl, apiKey, connected }: { baseUrl: string; apiKey:
   useEffect(() => {
     if (!connected) return
     let disposed = false
+    let initialized = false
+    let polling = false
     const base = baseUrl.replace(/\/v1\/?$/, "")
+
+    const flash = (event: ExpertLayerEvent, rows: number, cols: number) => {
+      const n = rows * cols
+      if (!pulseRef.current || pulseRef.current.length !== n) pulseRef.current = new Float32Array(n)
+      const pulse = pulseRef.current
+      for (let expert = 0; expert < cols; expert++) {
+        const byte = Number.parseInt(event.hits.slice((expert >> 3) * 2, (expert >> 3) * 2 + 2), 16) || 0
+        if (byte & (1 << (expert & 7))) pulse[event.row * cols + expert] = 1
+      }
+    }
+
+    const playNext = () => {
+      if (disposed) return
+      const event = eventQueue.current.shift()
+      if (!event) {
+        playbackTimer.current = null
+        if (latestSnapshot.current) setData(latestSnapshot.current)
+        return
+      }
+      setData(current => {
+        const baseFrame = current || latestSnapshot.current
+        if (!baseFrame) return current
+        flash(event, baseFrame.rows, baseFrame.cols)
+        return applyLayerEvent(baseFrame, event)
+      })
+      playbackTimer.current = window.setTimeout(playNext, LAYER_FRAME_MS)
+    }
+
     const poll = async () => {
+      if (polling) return
+      polling = true
       try {
-        const res = await fetch(endpoint(base, "/experts"), { headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {} })
+        const res = await fetch(endpoint(base, `/experts?after=${lastSeq.current}`), { headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {} })
         if (!res.ok) throw new Error(`/experts ${res.status}`)
         const next = (await res.json()) as ExpertMap
         if (disposed || !next.rows) return
-        setData(next)
+        const snapshot = { ...next, events: [] }
+        latestSnapshot.current = snapshot
         setProbeErr(false)
-        if (next.seq !== lastSeq.current && next.hits) {
+
+        if (!initialized) {
+          initialized = true
           lastSeq.current = next.seq
+          setData(snapshot)
+          return
+        }
+
+        const events = (next.events || []).filter(event => event.seq > lastSeq.current)
+        if (events.length) {
+          if (events[0].seq !== lastSeq.current + 1) {
+            eventQueue.current = []
+            if (playbackTimer.current !== null) window.clearTimeout(playbackTimer.current)
+            playbackTimer.current = null
+            setData(snapshot)
+          } else {
+            eventQueue.current.push(...events)
+            if (playbackTimer.current === null) playNext()
+          }
+          lastSeq.current = events[events.length - 1].seq
+        } else if (next.seq !== lastSeq.current && next.hits) {
+          // 兼容尚未实现 LAYER 协议的引擎。
+          lastSeq.current = next.seq
+          setData(snapshot)
           const n = next.rows * next.cols
           if (!pulseRef.current || pulseRef.current.length !== n) pulseRef.current = new Float32Array(n)
-          const p = pulseRef.current
+          const pulse = pulseRef.current
           for (let i = 0; i < n; i++) {
-            const byte = parseInt(next.hits.substr((i >> 3) * 2, 2), 16) || 0
-            if (byte & (1 << (i & 7))) p[i] = 1
+            const byte = Number.parseInt(next.hits.slice((i >> 3) * 2, (i >> 3) * 2 + 2), 16) || 0
+            if (byte & (1 << (i & 7))) pulse[i] = 1
           }
+        } else if (!eventQueue.current.length && playbackTimer.current === null) {
+          setData(snapshot)
         }
       } catch { if (!disposed) setProbeErr(true) /* surface repeated failures; keep the last frame */ }
+      finally { polling = false }
     }
     void poll()
-    const t = window.setInterval(() => void poll(), 1500)
-    return () => { disposed = true; window.clearInterval(t) }
+    const t = window.setInterval(() => void poll(), 200)
+    return () => {
+      disposed = true
+      window.clearInterval(t)
+      if (playbackTimer.current !== null) window.clearTimeout(playbackTimer.current)
+      playbackTimer.current = null
+      eventQueue.current = []
+      latestSnapshot.current = null
+      lastSeq.current = 0
+    }
   }, [baseUrl, apiKey, connected])
 
   // render loop: grid + decaying pulses

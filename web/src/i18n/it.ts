@@ -70,7 +70,7 @@ const it: Record<string, string> = {
   "brain.waiting": "in attesa del motore",
   "brain.layers": "{{rows}} layer × {{cols}} expert",
   "brain.brightnessHint": "luminosità = calore di routing",
-  "brain.flashHint": "⚡ flash bianco = instradato in questo turno",
+  "brain.flashHint": "⚡ flash bianco = instradato nel layer corrente",
   "brain.connectHint": "Connettiti al motore per vedere la corteccia.",
   "brain.neverRouted": "mai instradato",
   "brain.selections": "~2^{{heat}} selezioni",
