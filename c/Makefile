@@ -895,6 +895,7 @@ ifeq ($(COLI_V4_SUPPORTED),1)
 include Makefile.deepseek-v4.units
 V4_TEST_LINK_OBJS = \
 	COLI_V4_UNIT_ST.o \
+	COLI_V4_UNIT_LORA.o \
 	COLI_V4_UNIT_CONFIG.o \
 	COLI_V4_UNIT_MATH.o \
 	COLI_V4_UNIT_SPARSE_ATTENTION.o \
@@ -906,7 +907,7 @@ V4_TEST_LINK_OBJS = \
 tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c deepseek_v4.c deepseek_v4.h \
 		Makefile.deepseek-v4.units
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4-test-objs \
-		COLI_V4_UNIT_ST.o COLI_V4_UNIT_CONFIG.o COLI_V4_UNIT_MATH.o COLI_V4_UNIT_SPARSE_ATTENTION.o \
+		COLI_V4_UNIT_ST.o COLI_V4_UNIT_LORA.o COLI_V4_UNIT_CONFIG.o COLI_V4_UNIT_MATH.o COLI_V4_UNIT_SPARSE_ATTENTION.o \
 		COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o COLI_V4_UNIT_NATIVE_QUANT.o
 	$(CC) $(CFLAGS) $< $(V4_TEST_LINK_OBJS) -o $@ -pthread $(LDFLAGS)
 
@@ -916,6 +917,7 @@ V4_OWNERSHIP_OBJS = \
 	$(V4_OWN_DIR)/COLI_V4_UNIT_RUNTIME.o \
 	$(V4_OWN_DIR)/COLI_V4_UNIT_CONFIG.o \
 	$(V4_OWN_DIR)/COLI_V4_UNIT_ST.o \
+	$(V4_OWN_DIR)/COLI_V4_UNIT_LORA.o \
 	$(V4_OWN_DIR)/COLI_V4_UNIT_NATIVE_QUANT.o
 
 $(V4_OWN_DIR):
@@ -929,6 +931,9 @@ $(V4_OWN_DIR)/COLI_V4_UNIT_CONFIG.o: deepseek_v4.c deepseek_v4.h deepseek_v4_int
 
 $(V4_OWN_DIR)/COLI_V4_UNIT_ST.o: deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h st.h | $(V4_OWN_DIR)
 	$(CC) $(V4_OWN_CFLAGS) -DCOLI_V4_UNIT_ST -c deepseek_v4.c -o $@
+
+$(V4_OWN_DIR)/COLI_V4_UNIT_LORA.o: deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h st.h json.h | $(V4_OWN_DIR)
+	$(CC) $(V4_OWN_CFLAGS) -DCOLI_V4_UNIT_LORA -c deepseek_v4.c -o $@
 
 $(V4_OWN_DIR)/COLI_V4_UNIT_NATIVE_QUANT.o: deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h quant.h | $(V4_OWN_DIR)
 	$(CC) $(V4_OWN_CFLAGS) -DCOLI_V4_UNIT_NATIVE_QUANT -c deepseek_v4.c -o $@

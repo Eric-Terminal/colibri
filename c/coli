@@ -407,6 +407,9 @@ def env_for_engine(a, arch):
     if arch in ("deepseek_v4", "kimi"):
         if a.ram: env["RAM_GB"] = str(a.ram)
     if arch == "deepseek_v4":
+        lora = getattr(a, "lora", None)
+        if lora:
+            env["COLI_LORA"] = os.path.abspath(lora)
         if a.ctx: env["CTX"] = str(a.ctx)
         if getattr(a, "low_memory", False):
             env["COLI_V4_LOW_MEMORY"] = "1"
@@ -1538,6 +1541,8 @@ def main():
     common.add_argument("--ctx",type=int,default=0)
     common.add_argument("--low-memory", action="store_true",
                         help="DeepSeek V4：全局单槽 SSD 流式模式，避免依赖系统 Swap")
+    common.add_argument("--lora", default=os.environ.get("COLI_LORA"),
+                        help="DeepSeek V4：标准 PEFT LoRA 适配器目录")
     common.add_argument("--gpu",default=None,help="auto, none, or a device list such as 0,1")
     common.add_argument("--vram",type=float,default=0,help="total VRAM budget in GB (0=auto)")
     common.add_argument("--policy",choices=("quality","balanced","experimental-fast"),

@@ -133,6 +133,13 @@ class V4CliTest(unittest.TestCase):
         self.assertEqual(
             env["COLI_V4_CONTEXT_DIR"], os.path.abspath(args.model))
 
+    def test_v4_lora_directory_is_forwarded(self):
+        args = argparse.Namespace(
+            ngen=8, temp=0.0, ram=3, ctx=256, low_memory=True,
+            model="/models/deepseek-v4", lora="/adapters/eric-v1")
+        env = self.cli.env_for_engine(args, "deepseek_v4")
+        self.assertEqual(env["COLI_LORA"], os.path.abspath(args.lora))
+
     def test_kimi_engine_environment_forwards_ram(self):
         """#855: `--ram` reached the environment for deepseek_v4 only, so on Kimi
         K3 it was set and never read -- the flag a user reaches for to bound

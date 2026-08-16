@@ -215,10 +215,22 @@ typedef struct {
     uint64_t i64_bytes;
 } ColiDeepSeekV4LayerStats;
 
+typedef enum {
+    COLI_V4_LORA_Q_A,
+    COLI_V4_LORA_Q_B,
+    COLI_V4_LORA_KV,
+    COLI_V4_LORA_O_B,
+} ColiV4LoraTarget;
+
+typedef struct ColiV4LoraAdapter ColiV4LoraAdapter;
+typedef struct ColiV4LoraLayer ColiV4LoraLayer;
+
 typedef struct {
     ColiDeepSeekV4LayerPlan plan;
     ColiDeepSeekV4LayerStats stats;
     void *data[COLI_V4_MAX_LAYER_TENSORS];
+    /* 适配器由引擎持有；层权重只借用对应层，流式释放不得触碰它。 */
+    const ColiV4LoraLayer *lora;
 } ColiDeepSeekV4LayerWeights;
 
 int coli_v4_layer_plan(ColiDeepSeekV4LayerPlan *plan,
@@ -238,6 +250,22 @@ void coli_v4_layer_free(ColiV4Engine *engine,
 const void *coli_v4_layer_data(const ColiDeepSeekV4LayerWeights *weights,
                                const char *name,
                                const ColiDeepSeekV4TensorSpec **spec);
+
+int coli_v4_lora_open(ColiV4LoraAdapter **output, const char *directory,
+                      const ColiDeepSeekV4Config *config,
+                      char *error, size_t error_size);
+void coli_v4_lora_destroy(ColiV4LoraAdapter *adapter);
+const ColiV4LoraLayer *coli_v4_lora_layer(
+    const ColiV4LoraAdapter *adapter, int layer);
+uint64_t coli_v4_lora_bytes(const ColiV4LoraAdapter *adapter);
+int coli_v4_lora_rank(const ColiV4LoraAdapter *adapter);
+int coli_v4_lora_apply(const ColiV4LoraLayer *layer,
+                       ColiV4LoraTarget target, float *outputs,
+                       const float *inputs, int batch);
+int coli_v4_lora_linear_ref(float *outputs, const float *inputs,
+                            const uint16_t *a, const uint16_t *b,
+                            int input_size, int output_size, int rank,
+                            float scale, int batch);
 
 #ifdef __cplusplus
 }
@@ -703,6 +731,7 @@ const void *coli_v4_head_cache_data(const ColiV4Engine *engine,
 /* Runtime options live on ColiV4Engine. */
 typedef struct {
     const char *target_model_dir;
+    const char *lora_dir;
     uint64_t memory_limit_bytes;
     int context_tokens;
     int low_memory;
@@ -719,6 +748,7 @@ struct ColiV4Engine {
     ColiDeepSeekV4Config config;
     ColiDeepSeekV4RuntimeOptions runtime;
     ColiSafetensorsIndex *target_index;
+    ColiV4LoraAdapter *lora;
     ColiExpertStore *experts;
     ColiV4EngineMemorySummary summary;
     struct {
@@ -743,6 +773,7 @@ struct ColiV4Engine {
         int enabled;
     } dspark;
     char *owned_target_model_dir;
+    char *owned_lora_dir;
     int owns_experts;
     int owns_index;
     int active_sessions; /* sessions created against this engine */

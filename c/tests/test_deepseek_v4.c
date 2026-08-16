@@ -954,6 +954,55 @@ static int test_sparse_attention(void) {
 }
 /* ==== end test_deepseek_v4_sparse_attention.c ==== */
 
+static uint16_t test_bf16(float value) {
+    uint32_t bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+    return (uint16_t)(bits >> 16);
+}
+
+static int test_lora(int argc, char **argv) {
+    uint16_t a[] = {
+        test_bf16(1.0f), test_bf16(2.0f),
+        test_bf16(-1.0f), test_bf16(0.5f),
+    };
+    uint16_t b[] = {
+        test_bf16(3.0f), test_bf16(4.0f),
+        test_bf16(1.0f), test_bf16(-2.0f),
+        test_bf16(0.5f), test_bf16(0.25f),
+    };
+    float inputs[] = {2.0f, 3.0f, -1.0f, 4.0f};
+    float outputs[] = {1.0f, 1.0f, 1.0f, -1.0f, -2.0f, -3.0f};
+    const float expected[] = {45.0f, 19.0f, 8.75f, 65.0f, 0.0f, 5.5f};
+    if (coli_v4_lora_linear_ref(outputs, inputs, a, b, 2, 3, 2, 2.0f, 2))
+        return 1;
+    for (int item = 0; item < 6; item++)
+        if (fabsf(outputs[item] - expected[item]) > 1e-6f) return 1;
+
+    /* 手工运行时可追加 MODEL ADAPTER，校验真实 PEFT 目录的全部层和形状。 */
+    if (argc >= 3) {
+        ColiDeepSeekV4Config config;
+        ColiV4LoraAdapter *adapter = NULL;
+        char error[512] = {0};
+        if (coli_v4_config_load(&config, argv[1], error, sizeof(error)) ||
+            coli_v4_lora_open(&adapter, argv[2], &config,
+                              error, sizeof(error))) {
+            fprintf(stderr, "LoRA fixture: %s\n", error);
+            return 1;
+        }
+        if (coli_v4_lora_rank(adapter) < 1 ||
+            coli_v4_lora_bytes(adapter) == 0) {
+            coli_v4_lora_destroy(adapter);
+            return 1;
+        }
+        printf("DeepSeek-V4 LoRA fixture: rank=%d bytes=%llu\n",
+               coli_v4_lora_rank(adapter),
+               (unsigned long long)coli_v4_lora_bytes(adapter));
+        coli_v4_lora_destroy(adapter);
+    }
+    puts("DeepSeek-V4 LoRA tests: ok");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (test_attention_cache() != 0) {
         fprintf(stderr, "FAIL: test_attention_cache\n");
@@ -1001,6 +1050,10 @@ int main(int argc, char **argv) {
     }
     if (test_sparse_attention() != 0) {
         fprintf(stderr, "FAIL: test_sparse_attention\n");
+        return 1;
+    }
+    if (test_lora(argc, argv) != 0) {
+        fprintf(stderr, "FAIL: test_lora\n");
         return 1;
     }
     puts("DeepSeek-V4 tests: ok");

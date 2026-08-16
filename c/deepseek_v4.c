@@ -289,6 +289,317 @@ int coli_tensor_load_f32(ColiFloatTensor *output,
 #endif /* COLI_V4_UNIT_ST */
 
 
+#ifdef COLI_V4_UNIT_LORA
+/* 标准 PEFT LoRA 适配器：V4 只接入训练时声明的四个注意力投影。 */
+#include "deepseek_v4_internal.h"
+
+#include <math.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "json.h"
+#include "native_quant.h"
+
+typedef struct {
+    uint16_t *a;
+    uint16_t *b;
+    int input_size;
+    int output_size;
+    int rank;
+} ColiV4LoraLinear;
+
+struct ColiV4LoraLayer {
+    ColiV4LoraLinear linear[4];
+    float scale;
+};
+
+struct ColiV4LoraAdapter {
+    ColiV4LoraLayer *layers;
+    int layer_count;
+    int rank;
+    uint64_t bytes;
+};
+
+static int lora_error(char *error, size_t size, const char *format, ...) {
+    if (error && size) {
+        va_list arguments;
+        va_start(arguments, format);
+        vsnprintf(error, size, format, arguments);
+        va_end(arguments);
+    }
+    return -1;
+}
+
+static char *lora_read_config(const char *directory,
+                              char *error, size_t error_size) {
+    size_t path_size = strlen(directory) + sizeof("/adapter_config.json");
+    char *path = malloc(path_size);
+    if (!path) {
+        lora_error(error, error_size, "out of memory building LoRA config path");
+        return NULL;
+    }
+    snprintf(path, path_size, "%s/adapter_config.json", directory);
+    FILE *stream = fopen(path, "rb");
+    if (!stream || fseek(stream, 0, SEEK_END)) {
+        if (stream) fclose(stream);
+        lora_error(error, error_size, "cannot open LoRA config: %s", path);
+        free(path);
+        return NULL;
+    }
+    long length = ftell(stream);
+    if (length < 2 || fseek(stream, 0, SEEK_SET)) {
+        fclose(stream);
+        lora_error(error, error_size, "cannot read LoRA config: %s", path);
+        free(path);
+        return NULL;
+    }
+    char *json = malloc((size_t)length + 1);
+    if (!json || fread(json, 1, (size_t)length, stream) != (size_t)length) {
+        free(json);
+        fclose(stream);
+        lora_error(error, error_size, "cannot read LoRA config: %s", path);
+        free(path);
+        return NULL;
+    }
+    fclose(stream);
+    free(path);
+    json[length] = 0;
+    return json;
+}
+
+static int lora_false_or_missing(jval *root, const char *name) {
+    jval *value = json_get(root, name);
+    return !value || value->t == J_NULL ||
+           (value->t == J_BOOL && !value->boolean);
+}
+
+static int lora_parse_config(const char *directory, int *rank, float *scale,
+                             char *error, size_t error_size) {
+    char *text = lora_read_config(directory, error, error_size);
+    if (!text) return -1;
+    char *arena = NULL;
+    jval *root = json_parse(text, &arena);
+    free(text);
+    jval *kind = json_get(root, "peft_type");
+    jval *r = json_get(root, "r");
+    jval *alpha = json_get(root, "lora_alpha");
+    jval *bias = json_get(root, "bias");
+    jval *targets = json_get(root, "target_modules");
+    jval *rank_pattern = json_get(root, "rank_pattern");
+    jval *alpha_pattern = json_get(root, "alpha_pattern");
+    int valid = root && root->t == J_OBJ && kind && kind->t == J_STR &&
+                !strcmp(kind->str, "LORA") && r && r->t == J_NUM &&
+                isfinite(r->num) && floor(r->num) == r->num &&
+                r->num >= 1 && r->num <= 256 && alpha &&
+                alpha->t == J_NUM && isfinite(alpha->num) && alpha->num > 0 &&
+                bias && bias->t == J_STR && !strcmp(bias->str, "none") &&
+                targets && targets->t == J_STR && !strcmp(
+                    targets->str,
+                    "model\\.layers\\.\\d+\\.self_attn\\."
+                    "(q_a_proj|q_b_proj|kv_proj|o_b_proj)$") &&
+                (!rank_pattern || (rank_pattern->t == J_OBJ &&
+                                   rank_pattern->len == 0)) &&
+                (!alpha_pattern || (alpha_pattern->t == J_OBJ &&
+                                    alpha_pattern->len == 0)) &&
+                lora_false_or_missing(root, "fan_in_fan_out") &&
+                lora_false_or_missing(root, "lora_bias") &&
+                lora_false_or_missing(root, "use_dora") &&
+                lora_false_or_missing(root, "use_qalora") &&
+                lora_false_or_missing(root, "use_rslora");
+    if (valid) {
+        *rank = (int)r->num;
+        *scale = (float)(alpha->num / r->num);
+    }
+    json_free(root);
+    free(arena);
+    return valid ? 0 : lora_error(
+        error, error_size,
+        "unsupported PEFT LoRA config (requires the V4 attention-only targets, bias=none, no DoRA/RSLoRA/rank patterns)");
+}
+
+static int lora_load_matrix(uint16_t **output,
+                            const ColiSafetensorsIndex *index,
+                            const char *name, int rows, int columns,
+                            uint64_t *bytes, char *error, size_t error_size) {
+    const ColiSafetensorsTensor *tensor = coli_st_find(index, name);
+    uint64_t expected = (uint64_t)rows * (uint64_t)columns * sizeof(uint16_t);
+    if (!tensor || tensor->dtype != COLI_ST_BF16 || tensor->rank != 2 ||
+        tensor->shape[0] != rows || tensor->shape[1] != columns ||
+        (uint64_t)tensor->nbytes != expected)
+        return lora_error(error, error_size,
+                          "missing or incompatible LoRA tensor: %s", name);
+    uint16_t *data = malloc((size_t)expected);
+    if (!data)
+        return lora_error(error, error_size,
+                          "out of memory loading LoRA tensor: %s", name);
+    if (coli_st_read_tensor(index, tensor, data)) {
+        free(data);
+        return lora_error(error, error_size,
+                          "cannot read LoRA tensor: %s", name);
+    }
+    *output = data;
+    *bytes += expected;
+    return 0;
+}
+
+static int lora_load_linear(ColiV4LoraLinear *linear,
+                            const ColiSafetensorsIndex *index, int layer,
+                            const char *module, int input_size,
+                            int output_size, int rank, uint64_t *bytes,
+                            char *error, size_t error_size) {
+    char name[192];
+    int written = snprintf(
+        name, sizeof(name),
+        "base_model.model.model.layers.%d.self_attn.%s.lora_A.weight",
+        layer, module);
+    if (written < 0 || (size_t)written >= sizeof(name) ||
+        lora_load_matrix(&linear->a, index, name, rank, input_size,
+                         bytes, error, error_size))
+        return -1;
+    written = snprintf(
+        name, sizeof(name),
+        "base_model.model.model.layers.%d.self_attn.%s.lora_B.weight",
+        layer, module);
+    if (written < 0 || (size_t)written >= sizeof(name) ||
+        lora_load_matrix(&linear->b, index, name, output_size, rank,
+                         bytes, error, error_size))
+        return -1;
+    linear->input_size = input_size;
+    linear->output_size = output_size;
+    linear->rank = rank;
+    return 0;
+}
+
+void coli_v4_lora_destroy(ColiV4LoraAdapter *adapter) {
+    if (!adapter) return;
+    for (int layer = 0; layer < adapter->layer_count; layer++)
+        for (int target = 0; target < 4; target++) {
+            free(adapter->layers[layer].linear[target].b);
+            free(adapter->layers[layer].linear[target].a);
+        }
+    free(adapter->layers);
+    free(adapter);
+}
+
+int coli_v4_lora_open(ColiV4LoraAdapter **output, const char *directory,
+                      const ColiDeepSeekV4Config *config,
+                      char *error, size_t error_size) {
+    if (!output || !directory || !*directory || !config)
+        return lora_error(error, error_size, "invalid LoRA adapter arguments");
+    *output = NULL;
+    int rank = 0;
+    float scale = 0.0f;
+    if (lora_parse_config(directory, &rank, &scale, error, error_size))
+        return -1;
+    ColiSafetensorsIndex *index = NULL;
+    if (coli_st_index_open(&index, directory, error, error_size)) return -1;
+    ColiV4LoraAdapter *adapter = calloc(1, sizeof(*adapter));
+    if (!adapter) {
+        coli_st_index_close(index);
+        return lora_error(error, error_size, "out of memory creating LoRA adapter");
+    }
+    adapter->layer_count = config->num_hidden_layers;
+    adapter->rank = rank;
+    adapter->layers = calloc((size_t)adapter->layer_count,
+                             sizeof(*adapter->layers));
+    if (!adapter->layers) {
+        coli_st_index_close(index);
+        coli_v4_lora_destroy(adapter);
+        return lora_error(error, error_size, "out of memory creating LoRA layers");
+    }
+    int q_width = config->num_attention_heads * config->head_dim;
+    int o_width = config->o_groups * config->o_lora_rank;
+    static const char *modules[] = {
+        "q_a_proj", "q_b_proj", "kv_proj", "o_b_proj"
+    };
+    for (int layer = 0; layer < adapter->layer_count; layer++) {
+        adapter->layers[layer].scale = scale;
+        int inputs[] = {
+            config->hidden_size, config->q_lora_rank,
+            config->hidden_size, o_width
+        };
+        int outputs[] = {
+            config->q_lora_rank, q_width,
+            config->head_dim, config->hidden_size
+        };
+        for (int target = 0; target < 4; target++)
+            if (lora_load_linear(
+                    &adapter->layers[layer].linear[target], index, layer,
+                    modules[target], inputs[target], outputs[target], rank,
+                    &adapter->bytes, error, error_size)) {
+                coli_st_index_close(index);
+                coli_v4_lora_destroy(adapter);
+                return -1;
+            }
+    }
+    coli_st_index_close(index);
+    *output = adapter;
+    return 0;
+}
+
+const ColiV4LoraLayer *coli_v4_lora_layer(
+    const ColiV4LoraAdapter *adapter, int layer) {
+    return adapter && layer >= 0 && layer < adapter->layer_count
+        ? &adapter->layers[layer] : NULL;
+}
+
+uint64_t coli_v4_lora_bytes(const ColiV4LoraAdapter *adapter) {
+    return adapter ? adapter->bytes : 0;
+}
+
+int coli_v4_lora_rank(const ColiV4LoraAdapter *adapter) {
+    return adapter ? adapter->rank : 0;
+}
+
+int coli_v4_lora_linear_ref(float *outputs, const float *inputs,
+                            const uint16_t *a, const uint16_t *b,
+                            int input_size, int output_size, int rank,
+                            float scale, int batch) {
+    if (!outputs || !inputs || !a || !b || input_size < 1 ||
+        output_size < 1 || rank < 1 || rank > 256 || batch < 1 || batch > 64 ||
+        !isfinite(scale)) return -1;
+    float *latent = malloc((size_t)batch * rank * sizeof(*latent));
+    if (!latent) return -1;
+    for (int item = 0; item < batch; item++)
+        for (int row = 0; row < rank; row++) {
+            float sum = 0.0f;
+            const uint16_t *weight = a + (size_t)row * input_size;
+            const float *input = inputs + (size_t)item * input_size;
+            for (int column = 0; column < input_size; column++)
+                sum += coli_bf16_decode(weight[column]) * input[column];
+            latent[(size_t)item * rank + row] = sum;
+        }
+    int64_t count = (int64_t)batch * output_size;
+    #pragma omp parallel for schedule(static) if(count >= 4096)
+    for (int64_t index = 0; index < count; index++) {
+        int item = (int)(index / output_size);
+        int row = (int)(index % output_size);
+        const uint16_t *weight = b + (size_t)row * rank;
+        const float *low_rank = latent + (size_t)item * rank;
+        float sum = 0.0f;
+        for (int column = 0; column < rank; column++)
+            sum += coli_bf16_decode(weight[column]) * low_rank[column];
+        outputs[index] += scale * sum;
+    }
+    free(latent);
+    return 0;
+}
+
+int coli_v4_lora_apply(const ColiV4LoraLayer *layer,
+                       ColiV4LoraTarget target, float *outputs,
+                       const float *inputs, int batch) {
+    if (!layer) return 0;
+    if (target < COLI_V4_LORA_Q_A || target > COLI_V4_LORA_O_B) return -1;
+    const ColiV4LoraLinear *linear = &layer->linear[target];
+    return coli_v4_lora_linear_ref(
+        outputs, inputs, linear->a, linear->b, linear->input_size,
+        linear->output_size, linear->rank, layer->scale, batch);
+}
+#endif /* COLI_V4_UNIT_LORA */
+
+
 #ifdef COLI_V4_UNIT_LAYER_RESIDENT
 /* ######## deepseek_v4_layer_resident.c ######## */
 #define coli_v4_layer_load coli_v4_layer_resident_reference_load
@@ -590,9 +901,13 @@ int coli_v4_layer_load(ColiV4Engine *engine,
     if (!weights || !effective_config || !index || layer < 0 ||
         layer >= effective_config->num_hidden_layers ||
         layer >= COLI_V4_RESIDENT_MAX_LAYERS_V2) return -1;
-    if (!resident_enabled_v2(engine))
-        return coli_v4_layer_resident_reference_load(
+    if (!resident_enabled_v2(engine)) {
+        int result = coli_v4_layer_resident_reference_load(
             NULL, weights, effective_config, index, layer, error, error_size);
+        if (!result && engine)
+            weights->lora = coli_v4_lora_layer(engine->lora, layer);
+        return result;
+    }
     if (engine->dense_resident.index && engine->dense_resident.index != index) {
         if (error && error_size)
             snprintf(error, error_size,
@@ -604,6 +919,8 @@ int coli_v4_layer_load(ColiV4Engine *engine,
         if (coli_v4_layer_resident_reference_load(
                 NULL, &engine->dense_resident.layers[layer], effective_config, index,
                 layer, error, error_size)) return -1;
+        engine->dense_resident.layers[layer].lora =
+            coli_v4_lora_layer(engine->lora, layer);
         engine->dense_resident.ready[layer] = 1;
         engine->dense_resident.total_bytes +=
             engine->dense_resident.layers[layer].stats.total_bytes;
@@ -997,11 +1314,14 @@ static int build_runtime_plan(ColiV4Engine *engine,
     uint64_t context_reserve = coli_v4_context_reserve_bytes(
         &config, context, runtime->low_memory);
     uint64_t runtime_other = context_reserve + hidden + scratch;
-    if (UINT64_MAX - runtime_other < runtime->dspark_reserve_bytes) {
-        snprintf(error, error_size, "V4 DSpark reserve overflow");
+    uint64_t optional_resident = runtime->dspark_reserve_bytes +
+                                 coli_v4_lora_bytes(engine->lora);
+    if (optional_resident < runtime->dspark_reserve_bytes ||
+        UINT64_MAX - runtime_other < optional_resident) {
+        snprintf(error, error_size, "V4 optional runtime reserve overflow");
         return -1;
     }
-    runtime_other += runtime->dspark_reserve_bytes;
+    runtime_other += optional_resident;
     uint64_t available = coli_v4_os_available_memory();
     if (!available) {
         snprintf(error, error_size, "cannot determine OS available memory");
@@ -1910,7 +2230,9 @@ static int attention_token_impl(float *output,
     }
 
     int result = coli_fp8_matvec_ref(qa, &wq_a, input);
-    coli_bf16_round_array(qa, (size_t)q_rank);
+    if (!result) result = coli_v4_lora_apply(
+        weights->lora, COLI_V4_LORA_Q_A, qa, input, 1);
+    if (!result) coli_bf16_round_array(qa, (size_t)q_rank);
     const void *q_norm = layer_data(weights, "attn.q_norm.weight", NULL);
     if (!result && (!q_norm || decode_bf16(norm_weight, q_norm, (size_t)q_rank) ||
                     coli_v4_rmsnorm(qa, qa, norm_weight, q_rank,
@@ -1938,6 +2260,8 @@ static int attention_token_impl(float *output,
         }
     }
     if (!result) result = coli_fp8_matvec_ref(q, &wq_b, qa);
+    if (!result) result = coli_v4_lora_apply(
+        weights->lora, COLI_V4_LORA_Q_B, q, qa, 1);
     if (!result) coli_bf16_round_array(q, (size_t)heads * head_dim);
     for (int head = 0; !result && head < heads; head++) {
         float *values = q + (size_t)head * head_dim;
@@ -1948,6 +2272,8 @@ static int attention_token_impl(float *output,
     }
 
     if (!result) result = coli_fp8_matvec_ref(kv, &wkv, input);
+    if (!result) result = coli_v4_lora_apply(
+        weights->lora, COLI_V4_LORA_KV, kv, input, 1);
     if (!result) coli_bf16_round_array(kv, (size_t)head_dim);
     const void *kv_norm = layer_data(weights, "attn.kv_norm.weight", NULL);
     if (!result && (!kv_norm || decode_bf16(norm_weight, kv_norm, (size_t)head_dim) ||
@@ -2069,6 +2395,8 @@ static int attention_token_impl(float *output,
     }
     if (!result) coli_bf16_round_array(oa, (size_t)groups * o_rank);
     if (!result) result = coli_fp8_matvec_ref(output, &wo_b, oa);
+    if (!result) result = coli_v4_lora_apply(
+        weights->lora, COLI_V4_LORA_O_B, output, oa, 1);
     if (!result) coli_bf16_round_array(output, (size_t)hidden);
 
     free(compressed_indices);
@@ -2568,6 +2896,8 @@ int coli_v4_attention_window_batch_ref(
 
     const char *failure_stage = "query projection";
     int result = coli_fp8_matmul_batch_ref(qa, &wq_a, inputs, batch);
+    if (!result) result = coli_v4_lora_apply(
+        weights->lora, COLI_V4_LORA_Q_A, qa, inputs, batch);
     if (!result) coli_bf16_round_array(qa, (size_t)batch * q_rank);
     const void *raw_q_norm = layer_data(weights, "attn.q_norm.weight", NULL);
     if (!result && (!raw_q_norm || decode_bf16(norm, raw_q_norm, q_rank))) result = -1;
@@ -2611,6 +2941,8 @@ int coli_v4_attention_window_batch_ref(
 
     if (!result) failure_stage = "query expansion";
     if (!result) result = coli_fp8_matmul_batch_ref(q, &wq_b, qa, batch);
+    if (!result) result = coli_v4_lora_apply(
+        weights->lora, COLI_V4_LORA_Q_B, q, qa, batch);
     if (!result) coli_bf16_round_array(q, (size_t)batch * q_width);
     for (int item = 0; !result && item < batch; item++)
         for (int head = 0; head < heads; head++) {
@@ -2624,6 +2956,8 @@ int coli_v4_attention_window_batch_ref(
 
     if (!result) failure_stage = "KV projection";
     if (!result) result = coli_fp8_matmul_batch_ref(kv, &wkv, inputs, batch);
+    if (!result) result = coli_v4_lora_apply(
+        weights->lora, COLI_V4_LORA_KV, kv, inputs, batch);
     if (!result) coli_bf16_round_array(kv, (size_t)batch * head_dim);
     const void *raw_kv_norm = layer_data(weights, "attn.kv_norm.weight", NULL);
     if (!result && (!raw_kv_norm || decode_bf16(norm, raw_kv_norm, head_dim))) result = -1;
@@ -2762,6 +3096,8 @@ int coli_v4_attention_window_batch_ref(
     if (!result) coli_bf16_round_array(oa, (size_t)batch * oa_width);
     if (!result) failure_stage = "output projection B";
     if (!result) result = coli_fp8_matmul_batch_ref(outputs, &wo_b, oa, batch);
+    if (!result) result = coli_v4_lora_apply(
+        weights->lora, COLI_V4_LORA_O_B, outputs, oa, batch);
     if (!result) coli_bf16_round_array(outputs, (size_t)batch * hidden);
 
     free(group_outputs); free(group_inputs);
@@ -7561,6 +7897,9 @@ void coli_v4_engine_destroy(ColiV4Engine *engine) {
     engine->dense_resident.index = NULL;
     engine->dense_resident.total_bytes = 0;
 
+    coli_v4_lora_destroy(engine->lora);
+    engine->lora = NULL;
+
     free(engine->dspark.markov_w2);
     free(engine->dspark.markov_w1);
     engine->dspark.markov_w2 = NULL;
@@ -7580,6 +7919,9 @@ void coli_v4_engine_destroy(ColiV4Engine *engine) {
     }
     engine->target_index = NULL;
     engine->runtime.target_model_dir = NULL;
+    engine->runtime.lora_dir = NULL;
+    free(engine->owned_lora_dir);
+    engine->owned_lora_dir = NULL;
     free(engine->owned_target_model_dir);
     engine->owned_target_model_dir = NULL;
     free(engine);
@@ -7608,6 +7950,16 @@ int coli_v4_engine_open(ColiV4Engine **output,
         goto fail;
     }
     engine->runtime.target_model_dir = engine->owned_target_model_dir;
+    if (options->lora_dir && *options->lora_dir) {
+        engine->owned_lora_dir = strdup(options->lora_dir);
+        if (!engine->owned_lora_dir) {
+            if (error && error_size)
+                snprintf(error, error_size,
+                         "out of memory copying LoRA directory");
+            goto fail;
+        }
+        engine->runtime.lora_dir = engine->owned_lora_dir;
+    }
     engine->runtime.memory_limit_bytes = options->memory_limit_bytes;
     engine->runtime.context_tokens =
         options->context_tokens > 0 ? options->context_tokens : 4096;
@@ -7624,6 +7976,15 @@ int coli_v4_engine_open(ColiV4Engine **output,
                            error_size))
         goto fail;
     engine->owns_index = 1;
+    if (engine->runtime.lora_dir) {
+        if (coli_v4_lora_open(&engine->lora, engine->runtime.lora_dir,
+                              &engine->config, error, error_size))
+            goto fail;
+        fprintf(stderr,
+                "v4_lora adapter=%s rank=%d resident=%.2fMiB\n",
+                engine->runtime.lora_dir, coli_v4_lora_rank(engine->lora),
+                coli_v4_lora_bytes(engine->lora) / 1048576.0);
+    }
     const ColiSafetensorsTensor *dspark_w1 = NULL, *dspark_w2 = NULL;
     int requested_full_dspark = v4_dspark_full_wanted(options);
     int want_full_dspark = requested_full_dspark &&
@@ -8531,6 +8892,7 @@ static uint64_t state_hash_v70(const float *values, size_t count) {
 
 typedef struct {
     const char *model_dir;
+    const char *lora_dir;
     const char *prompt;
     const char *prompt_file;
     const char *system_prompt;
@@ -8552,6 +8914,7 @@ static void v4_cli_usage(FILE *stream, const char *program) {
         "       %s MODEL --oracle FILE [--teacher-forcing N] [--greedy N] [options]\n"
         "  --max-tokens N       maximum generated tokens (default: 128)\n"
         "  --memory-gb GiB      cap this process; otherwise use available RAM\n"
+        "  --lora PATH          load a standard PEFT LoRA adapter directory\n"
         "  --prompt-file PATH   read UTF-8 prompt from file (avoids argv encoding issues)\n"
         "  --system TEXT        optional system message\n"
         "  --thinking           enable the official V4 thinking prefix\n"
@@ -8640,6 +9003,9 @@ static int v4_cli_parse(int argc, char **argv, V4CliOptions *options) {
         } else if (!strcmp(option, "--memory-gb")) {
             if (++i == argc || v4_cli_memory(argv[i], &options->memory_gib))
                 return -1;
+        } else if (!strcmp(option, "--lora")) {
+            if (++i == argc || !argv[i][0]) return -1;
+            options->lora_dir = argv[i];
         } else if (!strcmp(option, "--prompt-file")) {
             if (++i == argc || !argv[i][0]) return -1;
             options->prompt_file = argv[i];
@@ -9421,6 +9787,7 @@ int coli_v4_session_generate(ColiV4Session *session,
 
 static int v4_oracle_teacher_forcing(
         const int *full_ids, int full_count, const int *expected, int expect_count,
+        ColiV4Engine *engine,
         ColiDeepSeekV4WindowAttentionState **attention,
         const ColiSafetensorsIndex *index, const ColiDeepSeekV4Config *config,
         ColiExpertStore *experts, char *error, size_t error_size,
@@ -9439,7 +9806,7 @@ static int v4_oracle_teacher_forcing(
             free(state); free(next); free(hidden);
             return -1;
         }
-    if (target_batch(NULL, &state, &next, attention, index, config, experts,
+    if (target_batch(engine, &state, &next, attention, index, config, experts,
                      full_ids, 0, full_count, NULL, NULL, error, error_size)) {
         free(state); free(next); free(hidden);
         return -1;
@@ -9468,6 +9835,7 @@ static int v4_oracle_teacher_forcing(
 
 static int v4_oracle_greedy_from_prompt(
         const int *prompt_ids, int prompt_count, int *generated, int max_new,
+        ColiV4Engine *engine,
         ColiDeepSeekV4WindowAttentionState **attention,
         const ColiSafetensorsIndex *index, const ColiDeepSeekV4Config *config,
         ColiExpertStore *experts, char *error, size_t error_size) {
@@ -9485,7 +9853,7 @@ static int v4_oracle_greedy_from_prompt(
             free(state); free(next); free(hidden);
             return -1;
         }
-    if (target_batch(NULL, &state, &next, attention, index, config, experts,
+    if (target_batch(engine, &state, &next, attention, index, config, experts,
                      prompt_ids, 0, prompt_count, NULL, NULL,
                      error, error_size)) {
         free(state); free(next); free(hidden);
@@ -9503,7 +9871,7 @@ static int v4_oracle_greedy_from_prompt(
     generated[count++] = current;
     int position = prompt_count;
     while (count < max_new && current != 1) {
-        if (target_token(NULL, &state, &next, attention, index, config, experts,
+        if (target_token(engine, &state, &next, attention, index, config, experts,
                          current, position, NULL, NULL, error, error_size) ||
             final_hidden(hidden, state, index, config, error, error_size) ||
             head_argmax(NULL, hidden, index, config, &current, &logit)) {
@@ -9900,6 +10268,7 @@ static int v4_serve_main(void) {
     ColiV4Session *session = NULL;
     ColiV4EngineOpenOptions open_options = {
         .target_model_dir = model_dir,
+        .lora_dir = getenv("COLI_LORA"),
         .context_tokens = context,
         .pin_slots_per_layer = -1,
         .no_dspark = 0,
@@ -10020,6 +10389,7 @@ int main(int argc, char **argv) {
     {
         ColiV4EngineOpenOptions open_opts = {
             .target_model_dir = cli.model_dir,
+            .lora_dir = cli.lora_dir ? cli.lora_dir : getenv("COLI_LORA"),
             .no_dspark = cli.no_dspark,
             .pin_slots_per_layer = -1,
             /* Same contract as v4_serve_main: CTX sets the session plan;
@@ -10084,6 +10454,7 @@ int main(int argc, char **argv) {
         if (tf_limit > full_count) tf_limit = full_count;
         int tf_matched = 0;
         if (v4_oracle_teacher_forcing(full_ids, full_count, tf_pred, tf_limit,
+                                      engine,
                                       attention, index, &config, experts,
                                       error, sizeof(error), &tf_matched)) {
             fprintf(stderr, "%s\n", error);
@@ -10097,7 +10468,7 @@ int main(int argc, char **argv) {
         int greedy_limit = cli.greedy;
         generated = malloc((size_t)(greedy_limit + 8) * sizeof(int));
         int got = v4_oracle_greedy_from_prompt(
-            prompt_ids, prompt_count, generated, greedy_limit, attention,
+            prompt_ids, prompt_count, generated, greedy_limit, engine, attention,
             index, &config, experts, error, sizeof(error));
         if (got < 0) {
             fprintf(stderr, "%s\n", error);

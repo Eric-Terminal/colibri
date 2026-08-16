@@ -80,6 +80,7 @@ typedef struct ColiV4Engine ColiV4Engine;
 typedef struct {
     /* Copied by coli_v4_engine_open; caller strings need not outlive the engine. */
     const char *target_model_dir;   /* required */
+    const char *lora_dir;           /* optional standard PEFT LoRA directory */
     uint64_t memory_limit_bytes;    /* 0 => use OS available memory */
     int context_tokens;             /* 0 => 4096 */
     int pin_slots_per_layer;        /* -1 => auto */
